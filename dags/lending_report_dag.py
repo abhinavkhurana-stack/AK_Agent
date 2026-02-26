@@ -813,6 +813,52 @@ def create_topline(**ctx):
 
 
 ###########################################################################
+#  FUNNEL ROW DEFINITIONS  (matches the Excel row order exactly)
+###########################################################################
+#
+#  Each tuple: (display_label, value_col, pct_numerator_col, pct_denominator_col)
+#    • value_col set   → count / amount row
+#    • pct cols set    → percentage row  (num / den × 100)
+#
+
+_FUNNEL_DISPLAY = [
+    ("Basic_Details",                               "basic_details",   None,             None),
+    ("Address_Details",                             "address",         None,             None),
+    ("% Address_details_from_Basic_Details",         None,             "address",        "basic_details"),
+    ("LPA_RUN",                                     "lpa_run",         None,             None),
+    ("%LPA_Run_from_Address_details",                None,             "lpa_run",        "address"),
+    ("LPA_PASS",                                    "lpa_pass",        None,             None),
+    ("%LPA_PASS_from_LPA_RUN",                       None,             "lpa_pass",       "lpa_run"),
+    ("Pre_BRE",                                     "pre_bre",         None,             None),
+    ("% Pre_BRE_from_LPA_PASS",                      None,             "pre_bre",        "lpa_pass"),
+    ("Bureau_Pull",                                 "bureau_pull",     None,             None),
+    ("%Bureau_Pull_from_Pre_BRE",                    None,             "bureau_pull",    "pre_bre"),
+    ("BRE_Success",                                 "bre_success",     None,             None),
+    ("%BRE_Success_from_Bureau_Pull",                None,             "bre_success",    "bureau_pull"),
+    ("Post_BRE",                                    "post_bre",        None,             None),
+    ("%Post_BRE_from_BRE_Success",                   None,             "post_bre",       "bre_success"),
+    ("PAN_Validation",                              "pan_kyc",         None,             None),
+    ("% PAN_Validation_from_Post_BRE",               None,             "pan_kyc",        "post_bre"),
+    ("Offer_Generated",                             "offer",           None,             None),
+    ("% Offer_Generated_from_PAN_Validation",        None,             "offer",          "pan_kyc"),
+    ("Offer_Accepted",                              "offer_accepted",  None,             None),
+    ("%Offer_accepted_from_Offer_Generated",         None,             "offer_accepted", "offer"),
+    ("Bank_Verified",                               "bank",            None,             None),
+    ("%Bank_Verified_from_Offer_Accepted",           None,             "bank",           "offer_accepted"),
+    ("NACH",                                        "nach",            None,             None),
+    ("% NACH_from_Bank_Verified",                    None,             "nach",           "bank"),
+    ("Loan_Sanctioned",                             "sanction",        None,             None),
+    ("% Loan_Sanctioned_from_NACH",                  None,             "sanction",       "nach"),
+    ("Drawdown",                                    "drawdown",        None,             None),
+    ("% Drawdown_from_Loan_Sanctioned",              None,             "drawdown",       "sanction"),
+    ("% Drawdown_from_Offer_Generated",              None,             "drawdown",       "offer"),
+    ("%Drawdown_from_Basic_Details",                 None,             "drawdown",       "basic_details"),
+    ("Sanctioned_Amount (in Cr.)",                  "sanction_amt_cr", None,             None),
+    ("Drawdown_Amount (in Cr.)",                    "drawdown_amt_cr", None,             None),
+]
+
+
+###########################################################################
 #  STEP 17 — HOURLY MAILER
 ###########################################################################
 
@@ -820,54 +866,12 @@ def send_hourly_mail(**ctx):
     engine = get_engine()
     import pandas as pd
 
-    hourly_windows = ("today", "yesterday", "mtd", "lmtd")
     now = datetime.now()
-
-    funnel_overall = pd.read_sql(
-        f"""SELECT step_name, step_count, pct_of_tof, pct_of_prev
-            FROM {SCHEMA}.lr_funnel
-            WHERE lender = (SELECT lender FROM {SCHEMA}.lr_lenderwise LIMIT 1)
-              AND user_type = 'ALL' AND time_window = 'today'
-            ORDER BY FIELD(step_name,
-                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
-                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
-                'Lender Details','Offer','Offer Accepted','KYC','Bank',
-                'NACH','Sanction','Drawdown')""",
-        engine,
-    )
-    overall_row = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_overall
-            WHERE user_type = 'ALL' AND time_window = 'today'""",
-        engine,
-    )
-    lenderwise = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_lenderwise
-            WHERE user_type = 'ALL' AND time_window IN {hourly_windows}""",
-        engine,
-    )
-    funnel_lenderwise = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_funnel
-            WHERE user_type = 'ALL' AND time_window = 'today'
-            ORDER BY lender, FIELD(step_name,
-                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
-                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
-                'Lender Details','Offer','Offer Accepted','KYC','Bank',
-                'NACH','Sanction','Drawdown')""",
-        engine,
-    )
+    overall = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
+    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
     unique_tof = pd.read_sql(
         f"""SELECT * FROM {SCHEMA}.lr_unique_tof
-            WHERE time_window IN {hourly_windows}""",
-        engine,
-    )
-    topline_today_yest = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_topline
-            WHERE comparison = 'Today vs Yesterday'""",
-        engine,
-    )
-    topline_mtd = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_topline
-            WHERE comparison = 'MTD vs LMTD'""",
+            WHERE time_window IN ('today','yesterday','mtd','lmtd')""",
         engine,
     )
 
@@ -875,18 +879,12 @@ def send_hourly_mail(**ctx):
         f"Hourly Lending Summary - EMI BBK "
         f"| {now.strftime('%d-%b-%Y %I:%M %p')}"
     )
-    body = _build_email_html(
+    body = _build_full_email(
         report_type="hourly",
         now=now,
-        overall_row=overall_row,
-        funnel_overall=funnel_overall,
+        overall=overall,
         lenderwise=lenderwise,
-        funnel_lenderwise=funnel_lenderwise,
         unique_tof=unique_tof,
-        topline_pairs=[
-            ("Today vs Yesterday Topline Summary (Amounts in ₹ Cr)", topline_today_yest),
-            ("MTD vs LMTD Topline Summary (Amounts in ₹ Cr)", topline_mtd),
-        ],
     )
 
     log.info("HOURLY MAILER — %s", subject)
@@ -906,74 +904,23 @@ def send_daily_mail(**ctx):
     engine = get_engine()
     import pandas as pd
 
-    daily_windows = ("t_minus_1", "t_minus_2", "mtd", "lmtd")
     now = datetime.now()
-
-    funnel_overall = pd.read_sql(
-        f"""SELECT step_name, step_count, pct_of_tof, pct_of_prev
-            FROM {SCHEMA}.lr_funnel
-            WHERE lender = (SELECT lender FROM {SCHEMA}.lr_lenderwise LIMIT 1)
-              AND user_type = 'ALL' AND time_window = 't_minus_1'
-            ORDER BY FIELD(step_name,
-                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
-                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
-                'Lender Details','Offer','Offer Accepted','KYC','Bank',
-                'NACH','Sanction','Drawdown')""",
-        engine,
-    )
-    overall_row = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_overall
-            WHERE user_type = 'ALL' AND time_window = 't_minus_1'""",
-        engine,
-    )
-    lenderwise = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_lenderwise
-            WHERE user_type = 'ALL' AND time_window IN {daily_windows}""",
-        engine,
-    )
-    funnel_lenderwise = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_funnel
-            WHERE user_type = 'ALL' AND time_window = 't_minus_1'
-            ORDER BY lender, FIELD(step_name,
-                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
-                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
-                'Lender Details','Offer','Offer Accepted','KYC','Bank',
-                'NACH','Sanction','Drawdown')""",
-        engine,
-    )
+    overall = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
+    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
     unique_tof = pd.read_sql(
         f"""SELECT * FROM {SCHEMA}.lr_unique_tof
-            WHERE time_window IN {daily_windows}""",
-        engine,
-    )
-    topline_t1_t2 = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_topline
-            WHERE comparison = 'T-1 vs T-2'""",
-        engine,
-    )
-    topline_mtd = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_topline
-            WHERE comparison = 'MTD vs LMTD'""",
+            WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')""",
         engine,
     )
 
     t1_date = (now - timedelta(days=1)).strftime("%d-%b-%Y")
-    subject = (
-        f"Daily Lending Summary - EMI BBK "
-        f"| {t1_date}"
-    )
-    body = _build_email_html(
+    subject = f"Daily Lending Summary - EMI BBK | {t1_date}"
+    body = _build_full_email(
         report_type="daily",
         now=now,
-        overall_row=overall_row,
-        funnel_overall=funnel_overall,
+        overall=overall,
         lenderwise=lenderwise,
-        funnel_lenderwise=funnel_lenderwise,
         unique_tof=unique_tof,
-        topline_pairs=[
-            (f"T-1 ({t1_date}) vs T-2 Topline Summary (Amounts in ₹ Cr)", topline_t1_t2),
-            ("MTD vs LMTD Topline Summary (Amounts in ₹ Cr)", topline_mtd),
-        ],
     )
 
     log.info("DAILY MAILER — %s", subject)
@@ -987,29 +934,29 @@ def send_daily_mail(**ctx):
 
 _EMAIL_CSS = """
 <style>
-    body   { font-family: Calibri, Arial, sans-serif; font-size: 12px;
-             color: #222; margin: 0; padding: 16px; background: #f7f7f7; }
-    .wrap  { max-width: 960px; margin: 0 auto; background: #fff;
-             padding: 20px 24px; border: 1px solid #ddd; }
-    h2     { font-size: 16px; color: #1a3c5e; margin: 0 0 4px 0; }
-    .sub   { font-size: 11px; color: #666; margin-bottom: 18px; }
-    h3     { font-size: 13px; color: #fff; background: #2980b9;
-             padding: 6px 10px; margin: 22px 0 0 0; }
-    h3.grn { background: #27ae60; }
-    h3.org { background: #e67e22; }
-    h3.prp { background: #8e44ad; }
-    table  { border-collapse: collapse; width: 100%; margin-bottom: 2px; }
-    th     { background: #34495e; color: #fff; font-weight: 600;
-             padding: 5px 10px; text-align: right; font-size: 11px;
-             border: 1px solid #2c3e50; white-space: nowrap; }
-    td     { padding: 4px 10px; text-align: right; font-size: 11px;
-             border: 1px solid #ccc; white-space: nowrap; }
-    th:first-child, td:first-child { text-align: left; }
-    tr:nth-child(even) td { background: #f4f8fb; }
-    tr.amt td { border-top: 2px solid #34495e; font-weight: 700; }
-    .note  { font-size: 10px; color: #888; margin: 2px 0 14px 0; }
-    .pos   { color: #27ae60; }
-    .neg   { color: #c0392b; }
+    body   { font-family: Calibri, Arial, sans-serif; font-size: 11px;
+             color: #222; margin: 0; padding: 12px; background: #f5f5f5; }
+    .wrap  { max-width: 1200px; margin: 0 auto; background: #fff;
+             padding: 16px 18px; border: 1px solid #ccc; }
+    h2     { font-size: 15px; color: #1a3c5e; margin: 0 0 4px 0; }
+    .sub   { font-size: 10px; color: #666; margin-bottom: 14px; }
+    h3     { font-size: 12px; color: #000; background: #d5e8d4;
+             padding: 5px 8px; margin: 18px 0 0 0;
+             border: 1px solid #82b366; }
+    h3.tl  { background: #dae8fc; border-color: #6c8ebf; }
+    h3.tof { background: #e1d5e7; border-color: #9673a6; }
+    table  { border-collapse: collapse; width: 100%; margin-bottom: 4px; }
+    th     { background: #d9d9d9; color: #000; font-weight: 700;
+             padding: 4px 8px; text-align: right; font-size: 10px;
+             border: 1px solid #999; white-space: nowrap; }
+    td     { padding: 3px 8px; text-align: right; font-size: 10px;
+             border: 1px solid #bbb; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; min-width: 220px; }
+    tr.pct td { color: #555; font-style: italic; background: #fafafa; }
+    tr.amt td { border-top: 2px solid #666; font-weight: 700; }
+    .note  { font-size: 9px; color: #888; margin: 2px 0 8px 0; }
+    .pos   { color: #006100; }
+    .neg   { color: #c00000; }
 </style>
 """
 
@@ -1017,7 +964,7 @@ _EMAIL_CSS = """
 def _fc(val):
     """Format count with Indian-style commas."""
     try:
-        n = int(val)
+        n = int(round(float(val)))
         if n < 0:
             return f"-{_fc(-n)}"
         s = str(n)
@@ -1031,100 +978,170 @@ def _fc(val):
             rest = rest[:-2]
         return ",".join(reversed(parts)) + "," + last3
     except (ValueError, TypeError):
-        return "—"
+        return ""
 
 
 def _fa(val):
-    """Format amount (₹ Cr) to 2 decimals."""
-    try:
-        return f"{float(val):,.2f}"
-    except (ValueError, TypeError):
-        return "—"
-
-
-def _fp(val):
-    """Format percentage."""
+    """Format amount to 2 decimals."""
     try:
         v = float(val)
-        return f"{v:.2f}%"
+        if v == 0:
+            return ""
+        return f"{v:,.2f}"
     except (ValueError, TypeError):
-        return "—"
+        return ""
 
 
-def _fpchange(val):
-    """Format % change with colour class."""
+def _fpct(num, den):
+    """Compute and format a percentage (num / den × 100)."""
     try:
-        v = float(val)
-        cls = "pos" if v >= 0 else "neg"
-        sign = "+" if v >= 0 else ""
-        return f'<span class="{cls}">{sign}{v:.2f}%</span>'
+        n = float(num or 0)
+        d = float(den or 0)
+        if d == 0:
+            return ""
+        return f"{n / d * 100:.2f}%"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _fpchange(va, vb):
+    """Format percentage change with colour."""
+    try:
+        a = float(va or 0)
+        b = float(vb or 0)
+        if b == 0:
+            return "None" if a == 0 else "—"
+        pct = (a - b) / b * 100
+        cls = "pos" if pct >= 0 else "neg"
+        sign = "+" if pct >= 0 else ""
+        return f'<span class="{cls}">{sign}{pct:.2f}%</span>'
     except (ValueError, TypeError):
         return "—"
 
 
-def _funnel_table_html(funnel_df, amounts_row=None):
+# ── Lookup helper ────────────────────────────────────────────────────
+
+def _make_lookup(df):
+    """Turn a summary DataFrame into {(time_window, user_type): Series}."""
+    lk = {}
+    for _, row in df.iterrows():
+        lk[(row["time_window"], row["user_type"])] = row
+    return lk
+
+
+def _val(lookup, tw, ut, col):
+    """Safely get a value from the lookup."""
+    row = lookup.get((tw, ut))
+    if row is None:
+        return 0
+    v = row.get(col, 0)
+    try:
+        return float(v) if v is not None else 0
+    except (ValueError, TypeError):
+        return 0
+
+
+# ── Funnel (Overall / Lenderwise summary) ────────────────────────────
+
+def _build_funnel_html(df, windows, wlabels, utypes):
     """
-    Build an HTML funnel table from lr_funnel rows.
-    Columns: Particulars | Count | % of TOF | % of Prev Step
-    Optionally appends Sanction Amt and Drawdown Amt rows.
+    Build the interleaved funnel table matching the Excel grid.
+
+    Columns:  Particular | w1_ut1 | w2_ut1 | w3_ut1 | w1_ut2 | … | w3_ut3
+    Rows:     count rows interleaved with '% X_from_Y' percentage rows
     """
-    rows = []
-    for _, r in funnel_df.iterrows():
-        rows.append(
-            f"<tr><td>{r['step_name']}</td>"
-            f"<td>{_fc(r['step_count'])}</td>"
-            f"<td>{_fp(r['pct_of_tof'])}</td>"
-            f"<td>{_fp(r['pct_of_prev'])}</td></tr>"
-        )
+    lk = _make_lookup(df)
 
-    if amounts_row is not None and not amounts_row.empty:
-        row = amounts_row.iloc[0]
-        rows.append(
-            f'<tr class="amt"><td>Sanction Amount (₹ Cr)</td>'
-            f"<td>{_fa(row.get('sanction_amt_cr', 0))}</td>"
-            f"<td></td><td></td></tr>"
-        )
-        rows.append(
-            f'<tr class="amt"><td>Drawdown Amount (₹ Cr)</td>'
-            f"<td>{_fa(row.get('drawdown_amt_cr', 0))}</td>"
-            f"<td></td><td></td></tr>"
-        )
-
-    return (
-        "<table>"
-        "<tr><th>Particulars</th><th>Count</th>"
-        "<th>% of TOF</th><th>% of Prev Step</th></tr>"
-        + "".join(rows)
-        + "</table>"
-    )
-
-
-def _topline_table_html(topline_df):
-    """Build comparison table: Metric | Period A | Period B | % Change."""
-    if topline_df.empty:
-        return "<p><em>No data</em></p>"
-
-    pa_label = topline_df.iloc[0]["period_a"]
-    pb_label = topline_df.iloc[0]["period_b"]
+    col_headers = []
+    col_keys = []
+    for ut_key, ut_label in utypes:
+        for wk in windows:
+            col_headers.append(f"{wlabels[wk]}_{ut_label}")
+            col_keys.append((wk, ut_key))
 
     header = (
-        f"<tr><th>Metric</th><th>{pa_label}</th>"
-        f"<th>{pb_label}</th><th>% Change</th></tr>"
+        "<tr><th>Particular</th>"
+        + "".join(f"<th>{h}</th>" for h in col_headers)
+        + "</tr>"
     )
+
     rows = []
-    for _, r in topline_df.iterrows():
-        is_amt = "Amount" in str(r["metric"])
-        fmt = _fa if is_amt else _fc
+    for label, val_col, pct_num, pct_den in _FUNNEL_DISPLAY:
+        is_pct = val_col is None
+        is_amt = (val_col or "").endswith("_amt_cr")
+
+        cells = []
+        for wk, ut in col_keys:
+            if is_pct:
+                cells.append(_fpct(_val(lk, wk, ut, pct_num),
+                                   _val(lk, wk, ut, pct_den)))
+            elif is_amt:
+                cells.append(_fa(_val(lk, wk, ut, val_col)))
+            else:
+                v = _val(lk, wk, ut, val_col)
+                cells.append(_fc(v) if v else "")
+
+        cls = ""
+        if is_pct:
+            cls = ' class="pct"'
+        elif is_amt:
+            cls = ' class="amt"'
+
         rows.append(
-            f"<tr><td>{r['metric']}</td>"
-            f"<td>{fmt(r['value_a'])}</td>"
-            f"<td>{fmt(r['value_b'])}</td>"
-            f"<td>{_fpchange(r['pct_change'])}</td></tr>"
+            f"<tr{cls}><td>{label}</td>"
+            + "".join(f"<td>{c}</td>" for c in cells)
+            + "</tr>"
         )
+
     return f"<table>{header}{''.join(rows)}</table>"
 
 
-def _unique_tof_table_html(tof_df):
+# ── Topline (per-lender: Today vs Yesterday / MTD vs LMTD) ──────────
+
+def _build_topline_html(lenderwise, overall, pa_key, pb_key, pa_lbl, pb_lbl):
+    """
+    One row per lender.  Columns:
+    Lender | Drawdown_A | Drawdown_B | Drawdown_Chg |
+            Sanction_A | Sanction_B | Sanction_Chg |
+            Offer_Gen_A| Offer_Gen_B| Offer_Gen_Chg
+    """
+    metrics = [
+        ("Drawdown", "drawdown_amt_cr", True),
+        ("Sanction", "sanction_amt_cr", True),
+        ("Offer_Gen", "offer", False),
+    ]
+
+    heads = ["<th>Lender</th>"]
+    for mname, _, _ in metrics:
+        heads.append(f"<th>{mname}_{pa_lbl}</th>")
+        heads.append(f"<th>{mname}_{pb_lbl}</th>")
+        heads.append(f"<th>{mname}_Change</th>")
+    header = "<tr>" + "".join(heads) + "</tr>"
+
+    def _row(label, df_src):
+        lk = _make_lookup(df_src)
+        cells = [f"<td><b>{label}</b></td>"]
+        for _, col, is_amt in metrics:
+            va = _val(lk, pa_key, "ALL", col)
+            vb = _val(lk, pb_key, "ALL", col)
+            fmt = _fa if is_amt else _fc
+            cells.append(f"<td>{fmt(va)}</td>")
+            cells.append(f"<td>{fmt(vb)}</td>")
+            cells.append(f"<td>{_fpchange(va, vb)}</td>")
+        return "<tr>" + "".join(cells) + "</tr>"
+
+    body_rows = [_row("Total", overall)]
+    for lname in sorted(lenderwise["lender"].unique()):
+        body_rows.append(
+            _row(lname, lenderwise[lenderwise["lender"] == lname])
+        )
+
+    return f"<table>{header}{''.join(body_rows)}</table>"
+
+
+# ── Unique TOF ───────────────────────────────────────────────────────
+
+def _build_unique_tof_html(tof_df):
     if tof_df.empty:
         return "<p><em>No data</em></p>"
     header = "<tr><th>Time Window</th><th>Unique Users</th><th>Unique Applications</th></tr>"
@@ -1138,68 +1155,70 @@ def _unique_tof_table_html(tof_df):
     return f"<table>{header}{''.join(rows)}</table>"
 
 
-def _build_email_html(
-    report_type,
-    now,
-    overall_row,
-    funnel_overall,
-    lenderwise,
-    funnel_lenderwise,
-    unique_tof,
-    topline_pairs,
-):
-    """
-    Assemble the full HTML email.
+# ── Main assembler ───────────────────────────────────────────────────
 
-    Sections (matching the shared Excel format):
-      1. Overall Summary  (funnel + amounts)
-      2. Lenderwise Summary — <Lender>  (one per lender)
-      3. Unique User TOF Summary
-      4. Today vs Yesterday / T-1 vs T-2 Topline (Amounts in ₹ Cr)
-      5. MTD vs LMTD Topline (Amounts in ₹ Cr)
+def _build_full_email(report_type, now, overall, lenderwise, unique_tof):
+    """
+    Assemble the full HTML email matching the shared Excel format.
+
+    Section order:
+      1. Today vs Yesterday Topline Summary
+      2. MTD vs LMTD Topline Summary (Amounts are in ₹ Cr)
+      3. Overall Summary  (interleaved funnel)
+      4. Lenderwise Summary — <Lender>  (one block per lender)
+      5. Unique User TOF Summary
     """
     if report_type == "hourly":
         title = "Hourly Lending Summary - EMI BBK"
         ts = now.strftime("%d-%b-%Y %I:%M %p")
+        summary_windows = ["today", "mtd", "lmtd"]
+        wlabels = {"today": "YTD", "mtd": "MTD", "lmtd": "LMTD"}
+        topline_cfgs = [
+            ("Today vs Yesterday Topline Summary",
+             "today", "yesterday", "TT", "YT"),
+            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr)",
+             "mtd", "lmtd", "MTD", "LMTD"),
+        ]
     else:
-        t1 = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+        t1_date = (now - timedelta(days=1)).strftime("%d-%b-%Y")
         title = "Daily Lending Summary - EMI BBK"
-        ts = t1
+        ts = t1_date
+        summary_windows = ["t_minus_1", "mtd", "lmtd"]
+        wlabels = {"t_minus_1": "T-1", "mtd": "MTD", "lmtd": "LMTD"}
+        topline_cfgs = [
+            (f"T-1 ({t1_date}) vs T-2 Topline Summary",
+             "t_minus_1", "t_minus_2", "T-1", "T-2"),
+            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr)",
+             "mtd", "lmtd", "MTD", "LMTD"),
+        ]
 
-    parts = [
-        _EMAIL_CSS,
-        '<div class="wrap">',
-        f"<h2>{title}</h2>",
-        f'<div class="sub">{ts}</div>',
-    ]
+    utypes = [("ALL", "Overall"), ("OLD", "Repeat"), ("NEW", "New")]
 
-    # ── 1. Overall Summary ───────────────────────────────────────────
-    parts.append('<h3>Overall Summary</h3>')
+    parts = [_EMAIL_CSS, '<div class="wrap">',
+             f"<h2>{title}</h2>", f'<div class="sub">{ts}</div>']
+
+    # ── 1 & 2. Topline tables ────────────────────────────────────────
+    for tl_title, pa, pb, pa_lbl, pb_lbl in topline_cfgs:
+        parts.append(f'<h3 class="tl">{tl_title}</h3>')
+        parts.append(_build_topline_html(lenderwise, overall, pa, pb, pa_lbl, pb_lbl))
+
+    # ── 3. Overall Summary ───────────────────────────────────────────
     parts.append(
-        '<div class="note">'
-        "All particulars are taken as per user instances — "
-        "multiple journeys from same user is expected"
-        "</div>"
+        '<h3>Overall Summary: '
+        '[** All Particulars are taken as per user instances- '
+        'multiple journeys from same user is expected]</h3>'
     )
-    parts.append(_funnel_table_html(funnel_overall, amounts_row=overall_row))
+    parts.append(_build_funnel_html(overall, summary_windows, wlabels, utypes))
 
-    # ── 2. Lenderwise Summary ────────────────────────────────────────
-    if not funnel_lenderwise.empty:
-        for lender_name in funnel_lenderwise["lender"].unique():
-            lf = funnel_lenderwise[funnel_lenderwise["lender"] == lender_name]
-            lw_row = lenderwise[lenderwise["lender"] == lender_name].head(1)
+    # ── 4. Lenderwise Summaries ──────────────────────────────────────
+    for lname in sorted(lenderwise["lender"].unique()):
+        ldf = lenderwise[lenderwise["lender"] == lname]
+        parts.append(f'<h3>Lenderwise Summary - {lname}:</h3>')
+        parts.append(_build_funnel_html(ldf, summary_windows, wlabels, utypes))
 
-            parts.append(f'<h3 class="grn">Lenderwise Summary — {lender_name}</h3>')
-            parts.append(_funnel_table_html(lf, amounts_row=lw_row))
-
-    # ── 3. Unique User TOF ──────────────────────────────────────────
-    parts.append('<h3 class="prp">Unique User TOF Summary</h3>')
-    parts.append(_unique_tof_table_html(unique_tof))
-
-    # ── 4 & 5. Topline Comparisons ──────────────────────────────────
-    for section_title, tl_df in topline_pairs:
-        parts.append(f'<h3 class="org">{section_title}</h3>')
-        parts.append(_topline_table_html(tl_df))
+    # ── 5. Unique User TOF ──────────────────────────────────────────
+    parts.append('<h3 class="tof">Unique User TOF Summary</h3>')
+    parts.append(_build_unique_tof_html(unique_tof))
 
     parts.append("</div>")
     return f"<html><head></head><body>{''.join(parts)}</body></html>"
