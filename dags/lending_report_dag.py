@@ -1,106 +1,32 @@
 """
 ===============================================================================
-  LENDING REPORT DAG  (Single DAG — Hourly + Daily)
+  LENDING REPORT DAG  (Single DAG — Hourly + Daily + Closed Funnel)
 ===============================================================================
 
-  WHAT IT DOES
-  ────────────
-  Runs every hour.  Creates a common base of intermediate tables on MySQL,
-  then builds all summary grids from them.
+  3 EMAILS
+  ────────
+  1. Hourly Lending Summary - EMI Open Funnel BBK   (every hour)
+  2. Daily  Lending Summary - EMI Open Funnel BBK   (once/day at 9 AM IST)
+  3. Daily  Lending Summary - EMI Closed Funnel BBK  (once/day at 9 AM IST)
 
-  Two mailers fire from this same DAG:
-    • Hourly mailer — Today, Yesterday, MTD, LMTD
-    • Daily  mailer — T-1, T-2, MTD, LMTD  (fires once at DAILY_MAIL_HOUR)
+  OPEN vs CLOSED
+  ──────────────
+  Both funnels reuse the SAME intermediate step tables (lr_base, lr_address,
+  lr_journey, lr_offer …).  The only difference is how they COUNT:
+    • Open  — each step counted independently
+    • Closed — each step requires ALL prior steps to have passed
 
   HOW TO ADD A NEW FLDG LENDER
   ────────────────────────────
   1.  Add one row to LENDER_ROWS  →  (partner_id, 'Name', 'FLDG')
   2.  Done.  All queries auto-include the new lender.
 
-  HOW TO ADD A DISTRIBUTION LENDER
-  ────────────────────────────────
-  1.  Add one row to LENDER_ROWS  →  (partner_id, 'Name', 'DISTRIBUTION')
-  2.  In create_base()   — append an INSERT for their applications table.
-  3.  In create_journey() — append an INSERT for their journey table.
-  4.  Repeat for any step whose source table differs.
-      Commented-out examples are provided inside each function.
-
-  HOW TO ADD / REMOVE / REORDER FUNNEL STEPS
-  ───────────────────────────────────────────
-  Each step is a separate function (create_address, create_journey, …).
-  • To remove a step, comment out its task in the DAG section.
-  • To add a step, write a new create_xxx() function and wire it in.
-  • To reorder, change the task dependency chain at the bottom.
-
-  OPEN vs CLOSED FUNNEL
-  ─────────────────────
-  By default every step table joins to lr_base (open funnel — independent).
-  To make step B depend on step A (closed funnel), change the JOIN in
-  step B's SQL from  lr_base  to  lr_<step_A>.
-
-  SCHEMA
-  ──────
-  All temporary tables are created in  mobikwik_schema  (configurable via
-  SCHEMA constant below).  Tables are dropped and recreated each run so
-  every query stays well under the 20-minute MySQL limit.
-
-  ═════════════════════════════════════════════════════════════════════════
-  SAMPLE OUTPUT — lr_lenderwise  (what you will see in MySQL)
-  ═════════════════════════════════════════════════════════════════════════
-
-  time_window | lender    | user_type | basic_details | address | lpa_run | … | offer | … | sanction | sanction_amt_cr | drawdown | drawdown_amt_cr
-  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  today       | SMFG      | NEW       | 3 500         | 2 800   |    420  |   |   180 |   |       60 |            1.20 |       30 |            0.50
-  today       | SMFG      | OLD       | 6 500         | 5 200   |    780  |   |   320 |   |      140 |            2.80 |       70 |            1.20
-  today       | SMFG      | ALL       |10 000         | 8 000   |  1 200  |   |   500 |   |      200 |            4.00 |      100 |            1.70
-  today       | Fullerton | ALL       |10 000         | 8 000   |  1 000  |   |   400 |   |      150 |            3.00 |       80 |            1.30
-  yesterday   | SMFG      | ALL       | 9 500         | 7 500   |  1 100  |   |   470 |   |      190 |            3.80 |       95 |            1.60
-  …           | …         | …         | …             | …       |    …    |   |   …   |   |      …   |            …    |       …  |            …
-  mtd         | SMFG      | ALL       |250 000        |200 000  | 30 000  |   |12 500 |   |    5 000 |          100.00 |    2 500 |           42.50
-  lmtd        | SMFG      | ALL       |240 000        |190 000  | 28 000  |   |11 800 |   |    4 700 |           94.00 |    2 350 |           40.00
-
-  ═════════════════════════════════════════════════════════════════════════
-  SAMPLE OUTPUT — lr_overall  (sum of all lenders)
-  ═════════════════════════════════════════════════════════════════════════
-
-  time_window | user_type | basic_details | address | lpa_run | … | sanction_amt_cr | drawdown_amt_cr
-  ────────────────────────────────────────────────────────────────────────────────────────────────────
-  today       | ALL       |20 000         |16 000   |  2 200  |   |            7.00 |            3.00
-  yesterday   | ALL       |19 000         |15 000   |  2 100  |   |            6.80 |            2.90
-  mtd         | ALL       |500 000        |400 000  | 58 000  |   |          194.00 |           82.50
-
-  ═════════════════════════════════════════════════════════════════════════
-  SAMPLE OUTPUT — lr_funnel  (percentages)
-  ═════════════════════════════════════════════════════════════════════════
-
-  time_window | lender | user_type | step_name      | step_count | pct_of_tof | pct_of_prev
-  ─────────────────────────────────────────────────────────────────────────────────────────────
-  today       | SMFG   | ALL       | Basic Details  |     10 000 |     100.00 |      100.00
-  today       | SMFG   | ALL       | Address        |      8 000 |      80.00 |       80.00
-  today       | SMFG   | ALL       | LPA Run        |      1 200 |      12.00 |       15.00
-  today       | SMFG   | ALL       | LPA Pass       |      1 100 |      11.00 |       91.67
-  …
-
-  ═════════════════════════════════════════════════════════════════════════
-  SAMPLE OUTPUT — lr_unique_tof
-  ═════════════════════════════════════════════════════════════════════════
-
-  time_window | unique_users | unique_applications
-  ─────────────────────────────────────────────────
-  today       |        9 200 |              10 000
-  yesterday   |        8 800 |               9 500
-
-  ═════════════════════════════════════════════════════════════════════════
-  SAMPLE OUTPUT — lr_topline
-  ═════════════════════════════════════════════════════════════════════════
-
-  comparison         | metric               | period_a | value_a | period_b  | value_b | pct_change
-  ───────────────────────────────────────────────────────────────────────────────────────────────────
-  Today vs Yesterday | Drawdown Amount (Cr)  | Today    |    3.00 | Yesterday |    2.90 |      +3.45
-  Today vs Yesterday | Sanction Amount (Cr)  | Today    |    7.00 | Yesterday |    6.80 |      +2.94
-  Today vs Yesterday | Offer Count           | Today    |     900 | Yesterday |     870 |      +3.45
-  MTD vs LMTD        | Drawdown Amount (Cr)  | MTD      |   82.50 | LMTD      |   78.00 |      +5.77
-  …
+  TESTING
+  ───────
+  To force-fire the daily emails outside of 9 AM IST, call:
+      test_daily_open_mail()
+      test_closed_daily_mail()
+  Or trigger the test_* Airflow tasks (wired at the bottom of the DAG).
 ===============================================================================
 """
 
@@ -116,24 +42,21 @@ log = logging.getLogger(__name__)
 
 
 ###########################################################################
-#  CONFIGURATION — edit this section only
+#  CONFIGURATION
 ###########################################################################
 
 SCHEMA = "mobikwik_schema"
 
-# Add / remove lenders here.  Format: (partner_id, 'Display Name', 'FLDG' or 'DISTRIBUTION')
 LENDER_ROWS = [
-    (4,  "SMFG",      "FLDG"),
-    (7,  "Fullerton", "FLDG"),
-    # (99, "NewLender", "FLDG"),          ← just add a row for a new FLDG lender
-    # (50, "DistPartner", "DISTRIBUTION"),← distribution lenders need INSERT blocks too
+    (16, "PFL",    "FLDG"),
+    (20, "NAC",    "FLDG"),
+    (24, "SMFGPL", "FLDG"),
+    # (99, "NewLender", "FLDG"),
 ]
 
-AMOUNT_DIVISOR = 1e7  # divide amounts by this to get ₹ Crores
-
+AMOUNT_DIVISOR = 1e7
 EMAIL_TO = ["abhinav.khurana@mobikwik.com"]
-
-DAILY_MAIL_HOUR_IST = 9  # daily mailer fires when IST hour == 9 (i.e. 9:00–9:59 AM)
+DAILY_MAIL_HOUR_IST = 9
 
 
 ###########################################################################
@@ -145,19 +68,16 @@ def get_engine():
     return sa.create_engine(
         "mysql+pymysql://analytics:vsn%400pl3TYujk23(o"
         "@data-analytics-mysql-prod.mbkinternal.in:3308/mobinew",
-        pool_recycle=1800,
-        pool_pre_ping=True,
+        pool_recycle=1800, pool_pre_ping=True,
     )
 
-
 def run_sql(statements):
-    """Execute a list of SQL strings inside one transaction."""
     engine = get_engine()
     with engine.begin() as conn:
         for s in statements:
             s = s.strip()
             if s:
-                log.info("SQL ▸ %s", s[:200].replace("\n", " "))
+                log.info("SQL > %s", s[:200].replace("\n", " "))
                 conn.execute(sa.text(s))
 
 
@@ -168,33 +88,21 @@ def run_sql(statements):
 def _fmt(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-
 def compute_windows():
-    """
-    Return (windows_dict, widest_start, widest_end).
-
-    windows_dict keys
-    ─────────────────
-    Hourly mailer  : today, yesterday, mtd, lmtd
-    Daily  mailer  : t_minus_1, t_minus_2, mtd, lmtd
-
-    Each value is a tuple (start_inclusive, end_exclusive) as strings.
-    """
     now       = datetime.now()
     today_00  = now.replace(hour=0, minute=0, second=0, microsecond=0)
     yest_00   = today_00 - timedelta(days=1)
-    yest_now  = now       - timedelta(days=1)          # same clock-time yesterday
+    yest_now  = now - timedelta(days=1)
     db4y_00   = today_00 - timedelta(days=2)
 
-    mtd_start = today_00.replace(day=1)
-    mtd_end   = today_00                               # through T-1 complete
-
+    mtd_start    = today_00.replace(day=1)
+    mtd_end      = today_00
     lmtd_start   = (mtd_start - timedelta(days=1)).replace(day=1)
     t1_day       = (today_00 - timedelta(days=1)).day
     max_prev_day = calendar.monthrange(lmtd_start.year, lmtd_start.month)[1]
     lmtd_end     = lmtd_start.replace(day=min(t1_day, max_prev_day)) + timedelta(days=1)
 
-    new_user_cutoff = _fmt(mtd_start)   # users before this date are "OLD"
+    new_user_cutoff = _fmt(mtd_start)
 
     windows = {
         "today":     (_fmt(today_00), _fmt(now)),
@@ -204,11 +112,7 @@ def compute_windows():
         "mtd":       (_fmt(mtd_start),  _fmt(mtd_end)),
         "lmtd":      (_fmt(lmtd_start), _fmt(lmtd_end)),
     }
-
-    widest_start = _fmt(lmtd_start)
-    widest_end   = _fmt(now)
-
-    return windows, widest_start, widest_end, new_user_cutoff
+    return windows, _fmt(lmtd_start), _fmt(now), new_user_cutoff
 
 
 ###########################################################################
@@ -219,21 +123,16 @@ def create_lenders(**ctx):
     stmts = [
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_lenders",
         f"""CREATE TABLE {SCHEMA}.lr_lenders (
-                lender_id   INT          NOT NULL,
-                lender_name VARCHAR(50)  NOT NULL,
-                lender_type VARCHAR(20)  NOT NULL,
-                PRIMARY KEY (lender_id)
-            )""",
+                lender_id INT NOT NULL, lender_name VARCHAR(50) NOT NULL,
+                lender_type VARCHAR(20) NOT NULL, PRIMARY KEY (lender_id))""",
     ]
     for lid, lname, ltype in LENDER_ROWS:
-        stmts.append(
-            f"INSERT INTO {SCHEMA}.lr_lenders VALUES ({lid}, '{lname}', '{ltype}')"
-        )
+        stmts.append(f"INSERT INTO {SCHEMA}.lr_lenders VALUES ({lid},'{lname}','{ltype}')")
     run_sql(stmts)
 
 
 ###########################################################################
-#  STEP 1 — BASE TABLE  (all HYBRID_KYC_FLOW users in widest date range)
+#  STEP 1 — BASE
 ###########################################################################
 
 def create_base(**ctx):
@@ -241,49 +140,21 @@ def create_base(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_base",
         f"""CREATE TABLE {SCHEMA}.lr_base AS
-            SELECT DISTINCT
-                b.mbkloanid,
-                b.createdat,
-                b.memberid,
-                CASE
-                    WHEN prev.memberid IS NULL THEN 'NEW'
-                    ELSE 'OLD'
-                END AS user_type
+            SELECT DISTINCT b.mbkloanid, b.createdat, b.memberid,
+                CASE WHEN prev.memberid IS NULL THEN 'NEW' ELSE 'OLD' END AS user_type
             FROM lending.boost b
             LEFT JOIN (
-                SELECT DISTINCT memberid
-                FROM lending.boost
-                WHERE kycflow = 'HYBRID_KYC_FLOW'
-                  AND createdat < '{cutoff}'
+                SELECT DISTINCT memberid FROM lending.boost
+                WHERE kycflow='HYBRID_KYC_FLOW' AND createdat < '{cutoff}'
             ) prev ON b.memberid = prev.memberid
-            WHERE b.kycflow = 'HYBRID_KYC_FLOW'
-              AND b.createdat >= '{ws}'
-              AND b.createdat <  '{we}'
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_base
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_dt  (createdat),
-            ADD INDEX idx_ut  (user_type)""",
+            WHERE b.kycflow='HYBRID_KYC_FLOW'
+              AND b.createdat >= '{ws}' AND b.createdat < '{we}'""",
+        f"ALTER TABLE {SCHEMA}.lr_base ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(createdat), ADD INDEX idx_ut(user_type)",
     ])
-
-    # ── DISTRIBUTION LENDER EXAMPLE ──
-    # Uncomment and fill in for each distribution lender whose base comes
-    # from a different table.
-    #
-    # run_sql([f"""
-    #     INSERT INTO {SCHEMA}.lr_base
-    #     SELECT DISTINCT
-    #         app_id   AS mbkloanid,
-    #         created  AS createdat,
-    #         user_id  AS memberid,
-    #         'NEW'    AS user_type
-    #     FROM dist_schema.applications
-    #     WHERE created >= '{ws}' AND created < '{we}'
-    # """])
 
 
 ###########################################################################
-#  STEP 2 — ADDRESS
+#  STEP 2–11 — INTERMEDIATE STEP TABLES  (shared by open + closed)
 ###########################################################################
 
 def create_address(**ctx):
@@ -292,145 +163,74 @@ def create_address(**ctx):
         f"""CREATE TABLE {SCHEMA}.lr_address AS
             SELECT DISTINCT mpd.mbkloanid
             FROM lending.memberprofiledetails mpd
-            INNER JOIN {SCHEMA}.lr_base b ON mpd.mbkloanid = b.mbkloanid
-            WHERE mpd.PermanentPincode IS NOT NULL
-              AND mpd.PermanentPincode > 0
-        """,
-        f"ALTER TABLE {SCHEMA}.lr_address ADD INDEX idx_mbk (mbkloanid)",
+            INNER JOIN {SCHEMA}.lr_base b ON mpd.mbkloanid=b.mbkloanid
+            WHERE mpd.PermanentPincode IS NOT NULL AND mpd.PermanentPincode>0""",
+        f"ALTER TABLE {SCHEMA}.lr_address ADD INDEX idx_mbk(mbkloanid)",
     ])
-
-
-###########################################################################
-#  STEP 3 — JOURNEY  (one row per user × lender)
-###########################################################################
 
 def create_journey(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_journey",
         f"""CREATE TABLE {SCHEMA}.lr_journey AS
-            SELECT
-                u.mbk_loan_id AS mbkloanid,
-                l.lender_id,
-                MAX(u.user_journey_status_stage = 'PreLenderSanityChecks')   AS lpa_run,
-                MAX(u.user_journey_status_stage = 'PostLenderSanityChecks')  AS lpa_pass,
-                MAX(u.user_journey_status_stage = 'PreBreFraudRulesSuccess') AS pre_bre,
-                MAX(u.user_journey_status_stage = 'BureauPullSuccess')       AS bureau_pull,
-                MAX(u.user_journey_status_stage = 'BreSuccess')              AS bre_success,
-                MAX(u.user_journey_status_stage = 'PostBreFraudRuleSuccess') AS post_bre,
-                MAX(u.user_journey_status_stage = 'PanKycValidationDone')    AS pan_kyc
+            SELECT u.mbk_loan_id AS mbkloanid, l.lender_id,
+                MAX(u.user_journey_status_stage='PreLenderSanityChecks')   AS lpa_run,
+                MAX(u.user_journey_status_stage='PostLenderSanityChecks')  AS lpa_pass,
+                MAX(u.user_journey_status_stage='PreBreFraudRulesSuccess') AS pre_bre,
+                MAX(u.user_journey_status_stage='BureauPullSuccess')       AS bureau_pull,
+                MAX(u.user_journey_status_stage='BreSuccess')              AS bre_success,
+                MAX(u.user_journey_status_stage='PostBreFraudRuleSuccess') AS post_bre,
+                MAX(u.user_journey_status_stage='PanKycValidationDone')    AS pan_kyc
             FROM lending.user_journey_status u
-            INNER JOIN {SCHEMA}.lr_base   b ON u.mbk_loan_id = b.mbkloanid
+            INNER JOIN {SCHEMA}.lr_base b ON u.mbk_loan_id=b.mbkloanid
             INNER JOIN {SCHEMA}.lr_lenders l
-                ON FIND_IN_SET(l.lender_id, u.eligible_partners) > 0
-                AND l.lender_type = 'FLDG'
-            GROUP BY u.mbk_loan_id, l.lender_id
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_journey
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_lid (lender_id)""",
+                ON FIND_IN_SET(l.lender_id, u.eligible_partners)>0 AND l.lender_type='FLDG'
+            GROUP BY u.mbk_loan_id, l.lender_id""",
+        f"ALTER TABLE {SCHEMA}.lr_journey ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id)",
     ])
-
-    # ── DISTRIBUTION LENDER JOURNEY ──
-    # run_sql([f"""
-    #     INSERT INTO {SCHEMA}.lr_journey
-    #     SELECT
-    #         app_id AS mbkloanid,
-    #         50     AS lender_id,
-    #         MAX(stage = 'LPA_RUN')   AS lpa_run,
-    #         ...
-    #     FROM dist_schema.journey
-    #     INNER JOIN {SCHEMA}.lr_base b ON app_id = b.mbkloanid
-    #     GROUP BY app_id
-    # """])
-
-
-###########################################################################
-#  STEP 4 — LENDER DETAILS
-###########################################################################
 
 def create_lender_det(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_lender_det",
         f"""CREATE TABLE {SCHEMA}.lr_lender_det AS
-            SELECT DISTINCT
-                lad.mbk_loan_id AS mbkloanid,
-                lad.lending_partner AS lender_id
+            SELECT DISTINCT lad.mbk_loan_id AS mbkloanid, lad.lending_partner AS lender_id
             FROM lending.lender_additional_details lad
-            INNER JOIN {SCHEMA}.lr_base    b ON lad.mbk_loan_id = b.mbkloanid
-            INNER JOIN {SCHEMA}.lr_lenders l ON lad.lending_partner = l.lender_id
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_lender_det
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_lid (lender_id)""",
+            INNER JOIN {SCHEMA}.lr_base b ON lad.mbk_loan_id=b.mbkloanid
+            INNER JOIN {SCHEMA}.lr_lenders l ON lad.lending_partner=l.lender_id""",
+        f"ALTER TABLE {SCHEMA}.lr_lender_det ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id)",
     ])
-
-
-###########################################################################
-#  STEP 5 — OFFER
-###########################################################################
 
 def create_offer(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_offer",
         f"""CREATE TABLE {SCHEMA}.lr_offer AS
-            SELECT DISTINCT
-                c.mbkloanid,
-                c.lendingpartnerid AS lender_id
+            SELECT DISTINCT c.mbkloanid, c.lendingpartnerid AS lender_id
             FROM lending.creditline c
-            INNER JOIN {SCHEMA}.lr_base    b ON c.mbkloanid = b.mbkloanid
-            INNER JOIN {SCHEMA}.lr_lenders l ON c.lendingpartnerid = l.lender_id
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_offer
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_lid (lender_id)""",
+            INNER JOIN {SCHEMA}.lr_base b ON c.mbkloanid=b.mbkloanid
+            INNER JOIN {SCHEMA}.lr_lenders l ON c.lendingpartnerid=l.lender_id""",
+        f"ALTER TABLE {SCHEMA}.lr_offer ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id)",
     ])
-
-
-###########################################################################
-#  STEP 6 — OFFER ACCEPTED  (joined through offer for lender specificity)
-###########################################################################
 
 def create_offer_accept(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_offer_accept",
         f"""CREATE TABLE {SCHEMA}.lr_offer_accept AS
-            SELECT DISTINCT
-                ua.mbkloanid,
-                o.lender_id
+            SELECT DISTINCT ua.mbkloanid, o.lender_id
             FROM lending.useracceptancedetails ua
-            INNER JOIN {SCHEMA}.lr_offer o ON ua.mbkloanid = o.mbkloanid
-            WHERE ua.stage = 'SAVE_OFFER'
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_offer_accept
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_lid (lender_id)""",
+            INNER JOIN {SCHEMA}.lr_offer o ON ua.mbkloanid=o.mbkloanid
+            WHERE ua.stage='SAVE_OFFER'""",
+        f"ALTER TABLE {SCHEMA}.lr_offer_accept ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id)",
     ])
-
-
-###########################################################################
-#  STEP 7 — KYC
-###########################################################################
 
 def create_kyc(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_kyc",
         f"""CREATE TABLE {SCHEMA}.lr_kyc AS
-            SELECT DISTINCT
-                uki.mbk_loan_id AS mbkloanid,
-                uki.lending_partner AS lender_id
+            SELECT DISTINCT uki.mbk_loan_id AS mbkloanid, uki.lending_partner AS lender_id
             FROM lending.user_kyc_info uki
-            INNER JOIN {SCHEMA}.lr_base    b ON uki.mbk_loan_id = b.mbkloanid
-            INNER JOIN {SCHEMA}.lr_lenders l ON uki.lending_partner = l.lender_id
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_kyc
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_lid (lender_id)""",
+            INNER JOIN {SCHEMA}.lr_base b ON uki.mbk_loan_id=b.mbkloanid
+            INNER JOIN {SCHEMA}.lr_lenders l ON uki.lending_partner=l.lender_id""",
+        f"ALTER TABLE {SCHEMA}.lr_kyc ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id)",
     ])
-
-
-###########################################################################
-#  STEP 8 — BANK  (user-level, no lender column)
-###########################################################################
 
 def create_bank(**ctx):
     run_sql([
@@ -438,16 +238,10 @@ def create_bank(**ctx):
         f"""CREATE TABLE {SCHEMA}.lr_bank AS
             SELECT DISTINCT bv.mbkloanid
             FROM lending.bankverification bv
-            INNER JOIN {SCHEMA}.lr_base b ON bv.mbkloanid = b.mbkloanid
-            WHERE bv.bankverified = 1
-        """,
-        f"ALTER TABLE {SCHEMA}.lr_bank ADD INDEX idx_mbk (mbkloanid)",
+            INNER JOIN {SCHEMA}.lr_base b ON bv.mbkloanid=b.mbkloanid
+            WHERE bv.bankverified=1""",
+        f"ALTER TABLE {SCHEMA}.lr_bank ADD INDEX idx_mbk(mbkloanid)",
     ])
-
-
-###########################################################################
-#  STEP 9 — NACH  (user-level)
-###########################################################################
 
 def create_nach(**ctx):
     run_sql([
@@ -455,372 +249,251 @@ def create_nach(**ctx):
         f"""CREATE TABLE {SCHEMA}.lr_nach AS
             SELECT DISTINCT nr.mbkloanid
             FROM lending.NachRegistration nr
-            INNER JOIN {SCHEMA}.lr_base b ON nr.mbkloanid = b.mbkloanid
-            WHERE nr.status IN ('eMandateSuccess', 'pNachSuccess')
-        """,
-        f"ALTER TABLE {SCHEMA}.lr_nach ADD INDEX idx_mbk (mbkloanid)",
+            INNER JOIN {SCHEMA}.lr_base b ON nr.mbkloanid=b.mbkloanid
+            WHERE nr.status IN ('eMandateSuccess','pNachSuccess')""",
+        f"ALTER TABLE {SCHEMA}.lr_nach ADD INDEX idx_mbk(mbkloanid)",
     ])
-
-
-###########################################################################
-#  STEP 10 — SANCTION  (lender-level, with amount)
-###########################################################################
 
 def create_sanction(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_sanction",
         f"""CREATE TABLE {SCHEMA}.lr_sanction AS
-            SELECT
-                c.mbkloanid,
-                c.lendingpartnerid AS lender_id,
-                SUM(c.sanctionedlineamount) AS amount
+            SELECT c.mbkloanid, c.lendingpartnerid AS lender_id, SUM(c.sanctionedlineamount) AS amount
             FROM lending.creditline c
-            INNER JOIN {SCHEMA}.lr_base    b ON c.mbkloanid = b.mbkloanid
-            INNER JOIN {SCHEMA}.lr_lenders l ON c.lendingpartnerid = l.lender_id
+            INNER JOIN {SCHEMA}.lr_base b ON c.mbkloanid=b.mbkloanid
+            INNER JOIN {SCHEMA}.lr_lenders l ON c.lendingpartnerid=l.lender_id
             WHERE c.status LIKE '%,11%'
-            GROUP BY c.mbkloanid, c.lendingpartnerid
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_sanction
-            ADD INDEX idx_mbk (mbkloanid),
-            ADD INDEX idx_lid (lender_id)""",
+            GROUP BY c.mbkloanid, c.lendingpartnerid""",
+        f"ALTER TABLE {SCHEMA}.lr_sanction ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id)",
     ])
-
-
-###########################################################################
-#  STEP 11 — DRAWDOWN  (user-level, with amount)
-###########################################################################
 
 def create_drawdown(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_drawdown",
         f"""CREATE TABLE {SCHEMA}.lr_drawdown AS
-            SELECT
-                d.mbkloanid,
-                SUM(d.drawamount) AS amount
+            SELECT d.mbkloanid, SUM(d.drawamount) AS amount
             FROM lending.drawdown d
-            INNER JOIN {SCHEMA}.lr_base b ON d.mbkloanid = b.mbkloanid
-            WHERE d.drawdownstatus IN (4, 17)
-            GROUP BY d.mbkloanid
-        """,
-        f"ALTER TABLE {SCHEMA}.lr_drawdown ADD INDEX idx_mbk (mbkloanid)",
+            INNER JOIN {SCHEMA}.lr_base b ON d.mbkloanid=b.mbkloanid
+            WHERE d.drawdownstatus IN (4,17)
+            GROUP BY d.mbkloanid""",
+        f"ALTER TABLE {SCHEMA}.lr_drawdown ADD INDEX idx_mbk(mbkloanid)",
     ])
 
 
 ###########################################################################
-#  STEP 12 — LENDERWISE SUMMARY
-###########################################################################
-#
-#  One row per (time_window, lender, user_type).
-#
-#  For each lender we build a SELECT that:
-#    • starts from lr_base  (the full user pool)
-#    • LEFT JOINs every step table
-#    • lender-aware tables are filtered to this lender via subqueries
-#      so every join stays 1:1 on mbkloanid (no fan-out)
-#    • GROUP BY user_type WITH ROLLUP gives NEW, OLD, ALL rows
-#
-#  All lenders × all windows are combined with UNION ALL and written
-#  as individual INSERT statements to stay within the 20-min query limit.
-#
+#  STEP 12 — OPEN FUNNEL LENDERWISE SUMMARY
 ###########################################################################
 
-_LENDERWISE_SELECT = """
+_OPEN_SELECT = """
     SELECT
         '{{wname}}'  AS time_window,
         '{{lname}}'  AS lender,
         COALESCE(b.user_type, 'ALL') AS user_type,
 
-        COUNT(DISTINCT b.mbkloanid)                                              AS basic_details,
-        COUNT(DISTINCT a.mbkloanid)                                              AS address,
+        COUNT(DISTINCT b.mbkloanid)                                       AS basic_details,
+        COUNT(DISTINCT a.mbkloanid)                                       AS address,
+        COUNT(DISTINCT CASE WHEN j.lpa_run=1     THEN j.mbkloanid END)   AS lpa_run,
+        COUNT(DISTINCT CASE WHEN j.lpa_pass=1    THEN j.mbkloanid END)   AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN j.pre_bre=1     THEN j.mbkloanid END)   AS pre_bre,
+        COUNT(DISTINCT CASE WHEN j.bureau_pull=1 THEN j.mbkloanid END)   AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN j.bre_success=1 THEN j.mbkloanid END)   AS bre_success,
+        COUNT(DISTINCT CASE WHEN j.post_bre=1    THEN j.mbkloanid END)   AS post_bre,
+        COUNT(DISTINCT CASE WHEN j.pan_kyc=1     THEN j.mbkloanid END)   AS pan_kyc,
+        COUNT(DISTINCT o.mbkloanid)                                       AS offer,
+        COUNT(DISTINCT oa.mbkloanid)                                      AS offer_accepted,
+        COUNT(DISTINCT bk.mbkloanid)                                      AS bank,
+        COUNT(DISTINCT n.mbkloanid)                                       AS nach,
+        COUNT(DISTINCT s.mbkloanid)                                       AS sanction,
+        ROUND(COALESCE(SUM(s.amount),0)/{amt_div},2)                     AS sanction_amt_cr,
+        COUNT(DISTINCT d.mbkloanid)                                       AS drawdown,
+        ROUND(COALESCE(SUM(d.amount),0)/{amt_div},2)                     AS drawdown_amt_cr
 
-        COUNT(DISTINCT CASE WHEN j.lpa_run     = 1 THEN j.mbkloanid END)        AS lpa_run,
-        COUNT(DISTINCT CASE WHEN j.lpa_pass    = 1 THEN j.mbkloanid END)        AS lpa_pass,
-        COUNT(DISTINCT CASE WHEN j.pre_bre     = 1 THEN j.mbkloanid END)        AS pre_bre,
-        COUNT(DISTINCT CASE WHEN j.bureau_pull = 1 THEN j.mbkloanid END)        AS bureau_pull,
-        COUNT(DISTINCT CASE WHEN j.bre_success = 1 THEN j.mbkloanid END)        AS bre_success,
-        COUNT(DISTINCT CASE WHEN j.post_bre    = 1 THEN j.mbkloanid END)        AS post_bre,
-        COUNT(DISTINCT CASE WHEN j.pan_kyc     = 1 THEN j.mbkloanid END)        AS pan_kyc,
+    FROM {sch}.lr_base b
+    LEFT JOIN {sch}.lr_address a ON a.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,lpa_run,lpa_pass,pre_bre,bureau_pull,
+                      bre_success,post_bre,pan_kyc
+               FROM {sch}.lr_journey WHERE lender_id={{lid}}) j ON j.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer WHERE lender_id={{lid}}) o ON o.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer_accept WHERE lender_id={{lid}}) oa ON oa.mbkloanid=b.mbkloanid
+    LEFT JOIN {sch}.lr_bank bk ON bk.mbkloanid=b.mbkloanid
+    LEFT JOIN {sch}.lr_nach n  ON n.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,SUM(amount) AS amount FROM {sch}.lr_sanction WHERE lender_id={{lid}} GROUP BY mbkloanid) s ON s.mbkloanid=b.mbkloanid
+    LEFT JOIN {sch}.lr_drawdown d ON d.mbkloanid=b.mbkloanid
 
-        COUNT(DISTINCT ld.mbkloanid)                                             AS lender_details,
-        COUNT(DISTINCT o.mbkloanid)                                              AS offer,
-        COUNT(DISTINCT oa.mbkloanid)                                             AS offer_accepted,
-        COUNT(DISTINCT k.mbkloanid)                                              AS kyc,
-        COUNT(DISTINCT bk.mbkloanid)                                             AS bank,
-        COUNT(DISTINCT n.mbkloanid)                                              AS nach,
-
-        COUNT(DISTINCT s.mbkloanid)                                              AS sanction,
-        ROUND(COALESCE(SUM(s.amount), 0) / {amt_div}, 2)                        AS sanction_amt_cr,
-        COUNT(DISTINCT d.mbkloanid)                                              AS drawdown,
-        ROUND(COALESCE(SUM(d.amount), 0) / {amt_div}, 2)                        AS drawdown_amt_cr
-
-    FROM {schema}.lr_base b
-
-    LEFT JOIN {schema}.lr_address a
-        ON a.mbkloanid = b.mbkloanid
-
-    LEFT JOIN (SELECT mbkloanid, lpa_run, lpa_pass, pre_bre, bureau_pull,
-                      bre_success, post_bre, pan_kyc
-               FROM {schema}.lr_journey WHERE lender_id = {{lid}}) j
-        ON j.mbkloanid = b.mbkloanid
-
-    LEFT JOIN (SELECT DISTINCT mbkloanid
-               FROM {schema}.lr_lender_det WHERE lender_id = {{lid}}) ld
-        ON ld.mbkloanid = b.mbkloanid
-
-    LEFT JOIN (SELECT DISTINCT mbkloanid
-               FROM {schema}.lr_offer WHERE lender_id = {{lid}}) o
-        ON o.mbkloanid = b.mbkloanid
-
-    LEFT JOIN (SELECT DISTINCT mbkloanid
-               FROM {schema}.lr_offer_accept WHERE lender_id = {{lid}}) oa
-        ON oa.mbkloanid = b.mbkloanid
-
-    LEFT JOIN (SELECT DISTINCT mbkloanid
-               FROM {schema}.lr_kyc WHERE lender_id = {{lid}}) k
-        ON k.mbkloanid = b.mbkloanid
-
-    LEFT JOIN {schema}.lr_bank bk
-        ON bk.mbkloanid = b.mbkloanid
-
-    LEFT JOIN {schema}.lr_nach n
-        ON n.mbkloanid = b.mbkloanid
-
-    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount
-               FROM {schema}.lr_sanction WHERE lender_id = {{lid}}
-               GROUP BY mbkloanid) s
-        ON s.mbkloanid = b.mbkloanid
-
-    LEFT JOIN {schema}.lr_drawdown d
-        ON d.mbkloanid = b.mbkloanid
-
-    WHERE b.createdat >= '{{wstart}}'
-      AND b.createdat <  '{{wend}}'
+    WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
     GROUP BY b.user_type WITH ROLLUP
-""".format(schema=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
+""".format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
 
 
-def create_lenderwise(**ctx):
+###########################################################################
+#  STEP 12c — CLOSED FUNNEL LENDERWISE SUMMARY
+###########################################################################
+#
+#  Same JOINs, but each step's COUNT requires ALL prior steps to be present.
+#  Journey flags are multiplied cumulatively (1*1*1=1, 1*0*1=0) so
+#  cf_pan_kyc=1 means every journey stage passed.
+#
+
+_CLOSED_SELECT = """
+    SELECT
+        '{{wname}}'  AS time_window,
+        '{{lname}}'  AS lender,
+        COALESCE(b.user_type, 'ALL') AS user_type,
+
+        COUNT(DISTINCT b.mbkloanid)  AS basic_details,
+        COUNT(DISTINCT a.mbkloanid)  AS address,
+
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf1=1 THEN j.mbkloanid END) AS lpa_run,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf2=1 THEN j.mbkloanid END) AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf3=1 THEN j.mbkloanid END) AS pre_bre,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf4=1 THEN j.mbkloanid END) AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf5=1 THEN j.mbkloanid END) AS bre_success,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf6=1 THEN j.mbkloanid END) AS post_bre,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1 THEN j.mbkloanid END) AS pan_kyc,
+
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL THEN o.mbkloanid END) AS offer,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL THEN oa.mbkloanid END) AS offer_accepted,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
+              AND bk.mbkloanid IS NOT NULL THEN bk.mbkloanid END) AS bank,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
+              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL THEN n.mbkloanid END) AS nach,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
+              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
+              AND s.mbkloanid IS NOT NULL THEN s.mbkloanid END) AS sanction,
+        ROUND(COALESCE(SUM(CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
+              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
+              THEN s.amount ELSE 0 END),0)/{amt_div},2) AS sanction_amt_cr,
+        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
+              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
+              AND s.mbkloanid IS NOT NULL AND d.mbkloanid IS NOT NULL THEN d.mbkloanid END) AS drawdown,
+        ROUND(COALESCE(SUM(CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
+              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
+              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
+              AND s.mbkloanid IS NOT NULL
+              THEN d.amount ELSE 0 END),0)/{amt_div},2) AS drawdown_amt_cr
+
+    FROM {sch}.lr_base b
+    LEFT JOIN {sch}.lr_address a ON a.mbkloanid=b.mbkloanid
+    LEFT JOIN (
+        SELECT mbkloanid,
+            lpa_run                                                          AS cf1,
+            lpa_run*lpa_pass                                                 AS cf2,
+            lpa_run*lpa_pass*pre_bre                                         AS cf3,
+            lpa_run*lpa_pass*pre_bre*bureau_pull                             AS cf4,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success                 AS cf5,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre        AS cf6,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre*pan_kyc AS cf7
+        FROM {sch}.lr_journey WHERE lender_id={{lid}}
+    ) j ON j.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer WHERE lender_id={{lid}}) o ON o.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer_accept WHERE lender_id={{lid}}) oa ON oa.mbkloanid=b.mbkloanid
+    LEFT JOIN {sch}.lr_bank bk ON bk.mbkloanid=b.mbkloanid
+    LEFT JOIN {sch}.lr_nach n  ON n.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,SUM(amount) AS amount FROM {sch}.lr_sanction WHERE lender_id={{lid}} GROUP BY mbkloanid) s ON s.mbkloanid=b.mbkloanid
+    LEFT JOIN {sch}.lr_drawdown d ON d.mbkloanid=b.mbkloanid
+
+    WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
+    GROUP BY b.user_type WITH ROLLUP
+""".format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
+
+
+###########################################################################
+#  SUMMARY TABLE COLUMN SPEC  (shared by open + closed create functions)
+###########################################################################
+
+_SUMMARY_COLS = """(
+    time_window VARCHAR(20), lender VARCHAR(50), user_type VARCHAR(10),
+    basic_details BIGINT DEFAULT 0, address BIGINT DEFAULT 0,
+    lpa_run BIGINT DEFAULT 0, lpa_pass BIGINT DEFAULT 0,
+    pre_bre BIGINT DEFAULT 0, bureau_pull BIGINT DEFAULT 0,
+    bre_success BIGINT DEFAULT 0, post_bre BIGINT DEFAULT 0,
+    pan_kyc BIGINT DEFAULT 0,
+    offer BIGINT DEFAULT 0, offer_accepted BIGINT DEFAULT 0,
+    bank BIGINT DEFAULT 0, nach BIGINT DEFAULT 0,
+    sanction BIGINT DEFAULT 0, sanction_amt_cr DECIMAL(14,2) DEFAULT 0,
+    drawdown BIGINT DEFAULT 0, drawdown_amt_cr DECIMAL(14,2) DEFAULT 0,
+    INDEX idx_tw(time_window), INDEX idx_ln(lender(50)), INDEX idx_ut(user_type)
+)"""
+
+def _create_summary(table_name, select_template):
     windows, _, _, _ = compute_windows()
-
     stmts = [
-        f"DROP TABLE IF EXISTS {SCHEMA}.lr_lenderwise",
-        f"""CREATE TABLE {SCHEMA}.lr_lenderwise (
-                time_window      VARCHAR(20),
-                lender           VARCHAR(50),
-                user_type        VARCHAR(10),
-                basic_details    BIGINT DEFAULT 0,
-                address          BIGINT DEFAULT 0,
-                lpa_run          BIGINT DEFAULT 0,
-                lpa_pass         BIGINT DEFAULT 0,
-                pre_bre          BIGINT DEFAULT 0,
-                bureau_pull      BIGINT DEFAULT 0,
-                bre_success      BIGINT DEFAULT 0,
-                post_bre         BIGINT DEFAULT 0,
-                pan_kyc          BIGINT DEFAULT 0,
-                lender_details   BIGINT DEFAULT 0,
-                offer            BIGINT DEFAULT 0,
-                offer_accepted   BIGINT DEFAULT 0,
-                kyc              BIGINT DEFAULT 0,
-                bank             BIGINT DEFAULT 0,
-                nach             BIGINT DEFAULT 0,
-                sanction         BIGINT DEFAULT 0,
-                sanction_amt_cr  DECIMAL(14,2) DEFAULT 0,
-                drawdown         BIGINT DEFAULT 0,
-                drawdown_amt_cr  DECIMAL(14,2) DEFAULT 0,
-                INDEX idx_tw (time_window),
-                INDEX idx_ln (lender(50)),
-                INDEX idx_ut (user_type)
-            )""",
+        f"DROP TABLE IF EXISTS {SCHEMA}.{table_name}",
+        f"CREATE TABLE {SCHEMA}.{table_name} {_SUMMARY_COLS}",
     ]
-
     for lid, lname, _ in LENDER_ROWS:
         for wname, (wstart, wend) in windows.items():
-            insert_sql = _LENDERWISE_SELECT.format(
-                wname=wname, lname=lname, lid=lid, wstart=wstart, wend=wend,
-            )
-            stmts.append(f"INSERT INTO {SCHEMA}.lr_lenderwise {insert_sql}")
-
+            sql = select_template.format(wname=wname, lname=lname, lid=lid, wstart=wstart, wend=wend)
+            stmts.append(f"INSERT INTO {SCHEMA}.{table_name} {sql}")
     run_sql(stmts)
 
-
-###########################################################################
-#  STEP 13 — OVERALL SUMMARY  (sum of all lenders)
-###########################################################################
-
-def create_overall(**ctx):
+def _create_overall(src_table, dst_table):
+    cols = ("basic_details,address,lpa_run,lpa_pass,pre_bre,bureau_pull,"
+            "bre_success,post_bre,pan_kyc,offer,offer_accepted,bank,nach,"
+            "sanction,sanction_amt_cr,drawdown,drawdown_amt_cr")
+    sums = ",".join(f"SUM({c}) AS {c}" for c in cols.split(","))
     run_sql([
-        f"DROP TABLE IF EXISTS {SCHEMA}.lr_overall",
-        f"""CREATE TABLE {SCHEMA}.lr_overall AS
-            SELECT
-                time_window,
-                user_type,
-                SUM(basic_details)   AS basic_details,
-                SUM(address)         AS address,
-                SUM(lpa_run)         AS lpa_run,
-                SUM(lpa_pass)        AS lpa_pass,
-                SUM(pre_bre)         AS pre_bre,
-                SUM(bureau_pull)     AS bureau_pull,
-                SUM(bre_success)     AS bre_success,
-                SUM(post_bre)        AS post_bre,
-                SUM(pan_kyc)         AS pan_kyc,
-                SUM(lender_details)  AS lender_details,
-                SUM(offer)           AS offer,
-                SUM(offer_accepted)  AS offer_accepted,
-                SUM(kyc)             AS kyc,
-                SUM(bank)            AS bank,
-                SUM(nach)            AS nach,
-                SUM(sanction)        AS sanction,
-                SUM(sanction_amt_cr) AS sanction_amt_cr,
-                SUM(drawdown)        AS drawdown,
-                SUM(drawdown_amt_cr) AS drawdown_amt_cr
-            FROM {SCHEMA}.lr_lenderwise
-            GROUP BY time_window, user_type
-        """,
-        f"""ALTER TABLE {SCHEMA}.lr_overall
-            ADD INDEX idx_tw (time_window),
-            ADD INDEX idx_ut (user_type)""",
+        f"DROP TABLE IF EXISTS {SCHEMA}.{dst_table}",
+        f"""CREATE TABLE {SCHEMA}.{dst_table} AS
+            SELECT time_window, user_type, {sums}
+            FROM {SCHEMA}.{src_table} GROUP BY time_window, user_type""",
+        f"ALTER TABLE {SCHEMA}.{dst_table} ADD INDEX idx_tw(time_window), ADD INDEX idx_ut(user_type)",
     ])
 
 
 ###########################################################################
-#  STEP 14 — FUNNEL  (row + column percentages, pivoted to rows)
+#  OPEN FUNNEL — create tasks
 ###########################################################################
-#
-#  Produces one row per (time_window, lender, user_type, step_name) with
-#  columns:  step_count, pct_of_tof (% of basic_details),
-#            pct_of_prev (% of preceding step).
-#
 
-_STEP_ORDER = [
-    ("basic_details",  "Basic Details",  "basic_details"),
-    ("address",        "Address",        "basic_details"),
-    ("lpa_run",        "LPA Run",        "address"),
-    ("lpa_pass",       "LPA Pass",       "lpa_run"),
-    ("pre_bre",        "Pre BRE",        "lpa_pass"),
-    ("bureau_pull",    "Bureau Pull",    "pre_bre"),
-    ("bre_success",    "BRE Success",    "bureau_pull"),
-    ("post_bre",       "Post BRE",       "bre_success"),
-    ("pan_kyc",        "PAN Validation", "post_bre"),
-    ("lender_details", "Lender Details", "pan_kyc"),
-    ("offer",          "Offer",          "lender_details"),
-    ("offer_accepted", "Offer Accepted", "offer"),
-    ("kyc",            "KYC",            "offer_accepted"),
-    ("bank",           "Bank",           "kyc"),
-    ("nach",           "NACH",           "bank"),
-    ("sanction",       "Sanction",       "nach"),
-    ("drawdown",       "Drawdown",       "sanction"),
-]
+def create_open_lenderwise(**ctx):
+    _create_summary("lr_lenderwise", _OPEN_SELECT)
 
-
-def create_funnel(**ctx):
-    unions = []
-    for col, label, prev_col in _STEP_ORDER:
-        unions.append(f"""
-            SELECT
-                time_window,
-                lender,
-                user_type,
-                '{label}'  AS step_name,
-                {col}      AS step_count,
-                ROUND({col} * 100.0 / NULLIF(basic_details, 0), 2)  AS pct_of_tof,
-                ROUND({col} * 100.0 / NULLIF({prev_col}, 0), 2)     AS pct_of_prev
-            FROM {SCHEMA}.lr_lenderwise
-        """)
-
-    full_select = " UNION ALL ".join(unions)
-
-    run_sql([
-        f"DROP TABLE IF EXISTS {SCHEMA}.lr_funnel",
-        f"CREATE TABLE {SCHEMA}.lr_funnel AS {full_select}",
-        f"""ALTER TABLE {SCHEMA}.lr_funnel
-            ADD INDEX idx_tw (time_window),
-            ADD INDEX idx_ln (lender(50))""",
-    ])
+def create_open_overall(**ctx):
+    _create_overall("lr_lenderwise", "lr_overall")
 
 
 ###########################################################################
-#  STEP 15 — UNIQUE USER TOF  (de-duplicated by memberid)
+#  CLOSED FUNNEL — create tasks
+###########################################################################
+
+def create_closed_lenderwise(**ctx):
+    _create_summary("lrc_lenderwise", _CLOSED_SELECT)
+
+def create_closed_overall(**ctx):
+    _create_overall("lrc_lenderwise", "lrc_overall")
+
+
+###########################################################################
+#  UNIQUE TOF + TOPLINE  (shared, computed from open funnel)
 ###########################################################################
 
 def create_unique_tof(**ctx):
     windows, _, _, _ = compute_windows()
-
     unions = []
     for wname, (wstart, wend) in windows.items():
         unions.append(f"""
-            SELECT
-                '{wname}' AS time_window,
-                COUNT(DISTINCT memberid)  AS unique_users,
+            SELECT '{wname}' AS time_window,
+                COUNT(DISTINCT memberid) AS unique_users,
                 COUNT(DISTINCT mbkloanid) AS unique_applications
             FROM {SCHEMA}.lr_base
-            WHERE createdat >= '{wstart}' AND createdat < '{wend}'
-        """)
-
-    full_select = " UNION ALL ".join(unions)
-
+            WHERE createdat>='{wstart}' AND createdat<'{wend}'""")
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_unique_tof",
-        f"CREATE TABLE {SCHEMA}.lr_unique_tof AS {full_select}",
-        f"ALTER TABLE {SCHEMA}.lr_unique_tof ADD INDEX idx_tw (time_window)",
+        f"CREATE TABLE {SCHEMA}.lr_unique_tof AS {' UNION ALL '.join(unions)}",
+        f"ALTER TABLE {SCHEMA}.lr_unique_tof ADD INDEX idx_tw(time_window)",
     ])
 
 
 ###########################################################################
-#  STEP 16 — TOPLINE COMPARISON  (Today vs Yesterday, MTD vs LMTD, etc.)
+#  FUNNEL DISPLAY ROWS  (drives the email grid)
 ###########################################################################
-
-def create_topline(**ctx):
-    pairs = [
-        ("today",     "Today",  "yesterday", "Yesterday"),
-        ("t_minus_1", "T-1",    "t_minus_2", "T-2"),
-        ("mtd",       "MTD",    "lmtd",      "LMTD"),
-    ]
-    metrics = [
-        ("Drawdown Count",        "drawdown"),
-        ("Drawdown Amount (Cr)",  "drawdown_amt_cr"),
-        ("Sanction Count",        "sanction"),
-        ("Sanction Amount (Cr)",  "sanction_amt_cr"),
-        ("Offer Count",           "offer"),
-    ]
-
-    unions = []
-    for pa_key, pa_label, pb_key, pb_label in pairs:
-        for metric_label, col in metrics:
-            unions.append(f"""
-                SELECT
-                    '{pa_label} vs {pb_label}'  AS comparison,
-                    '{metric_label}'            AS metric,
-                    '{pa_label}'                AS period_a,
-                    MAX(CASE WHEN time_window = '{pa_key}' THEN {col} END) AS value_a,
-                    '{pb_label}'                AS period_b,
-                    MAX(CASE WHEN time_window = '{pb_key}' THEN {col} END) AS value_b,
-                    ROUND(
-                        ( MAX(CASE WHEN time_window = '{pa_key}' THEN {col} END)
-                        - MAX(CASE WHEN time_window = '{pb_key}' THEN {col} END) )
-                        * 100.0
-                        / NULLIF(MAX(CASE WHEN time_window = '{pb_key}' THEN {col} END), 0)
-                    , 2) AS pct_change
-                FROM {SCHEMA}.lr_overall
-                WHERE user_type = 'ALL'
-                  AND time_window IN ('{pa_key}', '{pb_key}')
-            """)
-
-    full_select = " UNION ALL ".join(unions)
-
-    run_sql([
-        f"DROP TABLE IF EXISTS {SCHEMA}.lr_topline",
-        f"CREATE TABLE {SCHEMA}.lr_topline AS {full_select}",
-    ])
-
-
-###########################################################################
-#  FUNNEL ROW DEFINITIONS  (matches the Excel row order exactly)
-###########################################################################
-#
-#  Each tuple: (display_label, value_col, pct_numerator_col, pct_denominator_col)
-#    • value_col set   → count / amount row
-#    • pct cols set    → percentage row  (num / den × 100)
-#
 
 _FUNNEL_DISPLAY = [
     ("Basic_Details",                               "basic_details",   None,             None),
@@ -860,105 +533,7 @@ _FUNNEL_DISPLAY = [
 
 
 ###########################################################################
-#  STEP 17 — HOURLY MAILER
-###########################################################################
-
-def send_hourly_mail(**ctx):
-    engine = get_engine()
-    import pandas as pd
-
-    now = datetime.now()
-    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
-    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
-    unique_tof = pd.read_sql(
-        f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('today','yesterday','mtd','lmtd')", engine)
-
-    windows  = ["today", "mtd", "lmtd"]
-    wlabels  = {"today": "YTD", "mtd": "MTD", "lmtd": "LMTD"}
-    utypes   = [("ALL", "Overall"), ("OLD", "Repeat"), ("NEW", "New")]
-
-    Top_Yest      = _make_topline_df(lenderwise, overall, "today", "yesterday", "TTN", "YTN")
-    Top_MTD_LMTD  = _make_topline_df(lenderwise, overall, "mtd", "lmtd", "MTD", "LMTD")
-    Overall       = _make_funnel_df(overall, windows, wlabels, utypes)
-    Unique        = unique_tof[["time_window", "unique_users", "unique_applications"]]
-
-    subj = f"Hourly Lending Summary - EMI BBK || {now.strftime('%d-%b-%Y %I:%M %p')}"
-    body = _html_head()
-    body += "<p>Hi Team,<br>Please find the summary below:</p>\n"
-    body += "<h3>Today vs Yesterday Topline Summary:</h3>\n"
-    body += Top_Yest.to_html(index=False)
-    body += "<h3>MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):</h3>\n"
-    body += Top_MTD_LMTD.to_html(index=False)
-    body += "<h3>Unique User TOF Summary:</h3>\n"
-    body += Unique.to_html(index=False)
-    body += "<h3>Overall Summary: [** All Particulars are taken as per user instances- multiple journeys from same user is expected]</h3>\n"
-    body += Overall.to_html(index=False)
-    for lname in sorted(lenderwise["lender"].unique()):
-        ldf = lenderwise[lenderwise["lender"] == lname]
-        body += f"<h3>Lenderwise Summary - {lname}:</h3>\n"
-        body += _make_funnel_df(ldf, windows, wlabels, utypes).to_html(index=False) + "\n"
-    body += "</body>\n</html>"
-
-    log.info("HOURLY MAILER — %s", subj)
-    from airflow.utils.email import send_email
-    send_email(to=EMAIL_TO, subject=subj, html_content=body)
-
-
-###########################################################################
-#  STEP 18 — DAILY MAILER  (once per day at 9 AM IST)
-###########################################################################
-
-def send_daily_mail(**ctx):
-    # ── TESTING: comment out the next 3 lines to force-fire now ──────
-    now = datetime.now()
-    if now.hour != DAILY_MAIL_HOUR_IST:
-        log.info("Skipping daily mailer (IST hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
-        return
-    # ─────────────────────────────────────────────────────────────────
-
-    engine = get_engine()
-    import pandas as pd
-
-    now = datetime.now()
-    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
-    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
-    unique_tof = pd.read_sql(
-        f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')", engine)
-
-    windows  = ["t_minus_1", "mtd", "lmtd"]
-    wlabels  = {"t_minus_1": "T-1", "mtd": "MTD", "lmtd": "LMTD"}
-    utypes   = [("ALL", "Overall"), ("OLD", "Repeat"), ("NEW", "New")]
-
-    t1_date       = (now - timedelta(days=1)).strftime("%d-%b-%Y")
-    Top_Yest      = _make_topline_df(lenderwise, overall, "t_minus_1", "t_minus_2", "T-1", "T-2")
-    Top_MTD_LMTD  = _make_topline_df(lenderwise, overall, "mtd", "lmtd", "MTD", "LMTD")
-    Overall       = _make_funnel_df(overall, windows, wlabels, utypes)
-    Unique        = unique_tof[["time_window", "unique_users", "unique_applications"]]
-
-    subj = f"Daily Lending Summary - EMI BBK || {t1_date}"
-    body = _html_head()
-    body += "<p>Hi Team,<br>Please find the summary below:</p>\n"
-    body += "<h3>T-1 Vs T-2 Topline Summary (Amounts are in ₹ Cr):</h3>\n"
-    body += Top_Yest.to_html(index=False)
-    body += "<h3>MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):</h3>\n"
-    body += Top_MTD_LMTD.to_html(index=False)
-    body += "<h3>Unique User TOF Summary:</h3>\n"
-    body += Unique.to_html(index=False)
-    body += "<h3>Overall Summary: [** All Particulars are taken as per user instances- multiple journeys from same user is expected]</h3>\n"
-    body += Overall.to_html(index=False)
-    for lname in sorted(lenderwise["lender"].unique()):
-        ldf = lenderwise[lenderwise["lender"] == lname]
-        body += f"<h3>Lenderwise Summary - {lname}:</h3>\n"
-        body += _make_funnel_df(ldf, windows, wlabels, utypes).to_html(index=False) + "\n"
-    body += "</body>\n</html>"
-
-    log.info("DAILY MAILER — %s", subj)
-    from airflow.utils.email import send_email
-    send_email(to=EMAIL_TO, subject=subj, html_content=body)
-
-
-###########################################################################
-#  EMAIL HELPERS  (simple — just build DataFrames, use .to_html())
+#  EMAIL HELPERS
 ###########################################################################
 
 def _html_head():
@@ -971,80 +546,59 @@ def _html_head():
         "</style>\n</head>\n<body>\n"
     )
 
-
 def _make_lookup(df):
     lk = {}
     for _, row in df.iterrows():
         lk[(row["time_window"], row["user_type"])] = row
     return lk
 
-
 def _val(lookup, tw, ut, col):
     row = lookup.get((tw, ut))
-    if row is None:
-        return 0
+    if row is None: return 0
     try:
         v = row.get(col, 0)
         return float(v) if v is not None else 0
-    except (ValueError, TypeError):
-        return 0
-
+    except (ValueError, TypeError): return 0
 
 def _fc(v):
-    """Indian-style commas."""
     try:
         n = int(round(float(v)))
         s = str(abs(n))
-        if len(s) <= 3:
-            return ("-" + s) if n < 0 else s
+        if len(s) <= 3: return ("-"+s) if n<0 else s
         last3, rest = s[-3:], s[:-3]
         parts = []
-        while rest:
-            parts.append(rest[-2:]); rest = rest[:-2]
-        formatted = ",".join(reversed(parts)) + "," + last3
-        return ("-" + formatted) if n < 0 else formatted
-    except (ValueError, TypeError):
-        return ""
-
+        while rest: parts.append(rest[-2:]); rest = rest[:-2]
+        f = ",".join(reversed(parts))+","+last3
+        return ("-"+f) if n<0 else f
+    except (ValueError, TypeError): return ""
 
 def _fa(v):
     try:
         f = float(v)
         return f"{f:.2f}" if f else ""
-    except (ValueError, TypeError):
-        return ""
-
+    except (ValueError, TypeError): return ""
 
 def _fpct(num, den):
     try:
         n, d = float(num or 0), float(den or 0)
         return f"{n/d*100:.2f}%" if d else ""
-    except (ValueError, TypeError):
-        return ""
-
+    except (ValueError, TypeError): return ""
 
 def _pct_change(a, b):
     try:
         a, b = float(a or 0), float(b or 0)
-        if b == 0:
-            return "None" if a == 0 else ""
+        if b == 0: return "None" if a == 0 else ""
         return f"{(a-b)/b*100:.2f}%"
-    except (ValueError, TypeError):
-        return ""
-
+    except (ValueError, TypeError): return ""
 
 def _make_funnel_df(summary_df, windows, wlabels, utypes):
-    """Build the interleaved funnel DataFrame (rows = steps + % rows, cols = window × user_type)."""
     import pandas as pd
     lk = _make_lookup(summary_df)
-
-    col_names = ["Particular"]
-    col_keys  = []
+    col_names, col_keys = ["Particular"], []
     for ut_key, ut_label in utypes:
         for wk in windows:
             col_names.append(f"{wlabels[wk]}_{ut_label}")
             col_keys.append((wk, ut_key))
-
     rows = []
     for label, val_col, pct_num, pct_den in _FUNNEL_DISPLAY:
         row = [label]
@@ -1057,65 +611,178 @@ def _make_funnel_df(summary_df, windows, wlabels, utypes):
                 v = _val(lk, wk, ut, val_col)
                 row.append(_fc(v) if v else "")
         rows.append(row)
-
     return pd.DataFrame(rows, columns=col_names)
-
 
 def _make_topline_df(lenderwise, overall, pa_key, pb_key, pa_lbl, pb_lbl):
-    """Build per-lender topline DataFrame (one row per lender, metrics as columns)."""
     import pandas as pd
-    metrics = [
-        ("Drawdown", "drawdown_amt_cr", True),
-        ("Sanction", "sanction_amt_cr", True),
-        ("Offer_Gen", "offer", False),
-    ]
-
+    metrics = [("Drawdown","drawdown_amt_cr",True),("Sanction","sanction_amt_cr",True),("Offer_Gen","offer",False)]
     col_names = ["Lender"]
-    for m, _, _ in metrics:
-        col_names += [f"{m}_{pa_lbl}", f"{m}_{pb_lbl}", f"{m}_Change"]
-
+    for m,_,_ in metrics: col_names += [f"{m}_{pa_lbl}",f"{m}_{pb_lbl}",f"{m}_Change"]
     def _row(label, df):
-        lk = _make_lookup(df)
-        r = [label]
-        for _, col, is_amt in metrics:
-            va = _val(lk, pa_key, "ALL", col)
-            vb = _val(lk, pb_key, "ALL", col)
+        lk = _make_lookup(df); r = [label]
+        for _,col,is_amt in metrics:
+            va, vb = _val(lk,pa_key,"ALL",col), _val(lk,pb_key,"ALL",col)
             fmt = _fa if is_amt else _fc
-            r += [fmt(va), fmt(vb), _pct_change(va, vb)]
+            r += [fmt(va), fmt(vb), _pct_change(va,vb)]
         return r
-
     rows = [_row("Total", overall)]
-    for lname in sorted(lenderwise["lender"].unique()):
-        rows.append(_row(lname, lenderwise[lenderwise["lender"] == lname]))
-
+    for ln in sorted(lenderwise["lender"].unique()):
+        rows.append(_row(ln, lenderwise[lenderwise["lender"]==ln]))
     return pd.DataFrame(rows, columns=col_names)
 
 
 ###########################################################################
-#  CLEANUP  (optional — drop intermediate step tables)
+#  BUILD EMAIL BODY  (reusable for open + closed)
 ###########################################################################
 
-_INTERMEDIATE_TABLES = [
-    "lr_base", "lr_address", "lr_journey", "lr_lender_det",
-    "lr_offer", "lr_offer_accept", "lr_kyc", "lr_bank",
-    "lr_nach", "lr_sanction", "lr_drawdown",
-]
+def _build_body(overall, lenderwise, unique_tof, windows, wlabels, utypes,
+                topline_cfgs, greeting="Hi Team,<br>Please find the summary below:"):
+    import pandas as pd
+    body = _html_head()
+    body += f"<p>{greeting}</p>\n"
 
+    for title, pa, pb, pa_lbl, pb_lbl in topline_cfgs:
+        body += f"<h3>{title}</h3>\n"
+        body += _make_topline_df(lenderwise, overall, pa, pb, pa_lbl, pb_lbl).to_html(index=False)
 
-def cleanup(**ctx):
-    stmts = [f"DROP TABLE IF EXISTS {SCHEMA}.{t}" for t in _INTERMEDIATE_TABLES]
-    run_sql(stmts)
+    if unique_tof is not None and not unique_tof.empty:
+        body += "<h3>Unique User TOF Summary:</h3>\n"
+        body += unique_tof[["time_window","unique_users","unique_applications"]].to_html(index=False)
+
+    body += ("<h3>Overall Summary: [** All Particulars are taken as per user "
+             "instances- multiple journeys from same user is expected]</h3>\n")
+    body += _make_funnel_df(overall, windows, wlabels, utypes).to_html(index=False)
+
+    for lname in sorted(lenderwise["lender"].unique()):
+        ldf = lenderwise[lenderwise["lender"]==lname]
+        body += f"<h3>Lenderwise Summary - {lname}:</h3>\n"
+        body += _make_funnel_df(ldf, windows, wlabels, utypes).to_html(index=False) + "\n"
+
+    body += "</body>\n</html>"
+    return body
 
 
 ###########################################################################
-#  DAG DEFINITION
+#  MAILER 1 — Hourly Open Funnel  (every run)
 ###########################################################################
 
-default_args = {
-    "owner": "analytics",
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
-}
+def send_hourly_mail(**ctx):
+    engine = get_engine()
+    import pandas as pd
+    now = datetime.now()
+
+    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
+    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
+    unique_tof = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('today','yesterday','mtd','lmtd')", engine)
+
+    subj = f"Hourly Lending Summary - EMI Open Funnel BBK || {now.strftime('%d-%b-%Y %I:%M %p')}"
+    body = _build_body(
+        overall, lenderwise, unique_tof,
+        windows=["today","mtd","lmtd"],
+        wlabels={"today":"YTD","mtd":"MTD","lmtd":"LMTD"},
+        utypes=[("ALL","Overall"),("OLD","Repeat"),("NEW","New")],
+        topline_cfgs=[
+            ("Today vs Yesterday Topline Summary:","today","yesterday","TTN","YTN"),
+            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):","mtd","lmtd","MTD","LMTD"),
+        ],
+    )
+    log.info("HOURLY OPEN — %s", subj)
+    from airflow.utils.email import send_email
+    send_email(to=EMAIL_TO, subject=subj, html_content=body)
+
+
+###########################################################################
+#  MAILER 2 — Daily Open Funnel  (9 AM IST)
+###########################################################################
+
+def send_daily_open_mail(**ctx):
+    now = datetime.now()
+    if now.hour != DAILY_MAIL_HOUR_IST:
+        log.info("Skipping daily open mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
+        return
+    _do_send_daily_open()
+
+def _do_send_daily_open():
+    engine = get_engine()
+    import pandas as pd
+    now = datetime.now()
+
+    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
+    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
+    unique_tof = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')", engine)
+
+    t1 = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+    subj = f"Daily Lending Summary - EMI Open Funnel BBK || {t1}"
+    body = _build_body(
+        overall, lenderwise, unique_tof,
+        windows=["t_minus_1","mtd","lmtd"],
+        wlabels={"t_minus_1":"T-1","mtd":"MTD","lmtd":"LMTD"},
+        utypes=[("ALL","Overall"),("OLD","Repeat"),("NEW","New")],
+        topline_cfgs=[
+            (f"T-1 Vs T-2 Topline Summary (Amounts are in ₹ Cr):","t_minus_1","t_minus_2","T-1","T-2"),
+            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):","mtd","lmtd","MTD","LMTD"),
+        ],
+    )
+    log.info("DAILY OPEN — %s", subj)
+    from airflow.utils.email import send_email
+    send_email(to=EMAIL_TO, subject=subj, html_content=body)
+
+
+###########################################################################
+#  MAILER 3 — Daily Closed Funnel  (9 AM IST)
+###########################################################################
+
+def send_closed_daily_mail(**ctx):
+    now = datetime.now()
+    if now.hour != DAILY_MAIL_HOUR_IST:
+        log.info("Skipping daily closed mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
+        return
+    _do_send_closed_daily()
+
+def _do_send_closed_daily():
+    engine = get_engine()
+    import pandas as pd
+    now = datetime.now()
+
+    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lrc_overall", engine)
+    lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lrc_lenderwise", engine)
+    unique_tof = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')", engine)
+
+    t1 = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+    subj = f"Daily Lending Summary - EMI Closed Funnel BBK || {t1}"
+    body = _build_body(
+        overall, lenderwise, unique_tof,
+        windows=["t_minus_1","mtd","lmtd"],
+        wlabels={"t_minus_1":"T-1","mtd":"MTD","lmtd":"LMTD"},
+        utypes=[("ALL","Overall"),("OLD","Repeat"),("NEW","New")],
+        topline_cfgs=[
+            (f"T-1 Vs T-2 Topline Summary (Amounts are in ₹ Cr):","t_minus_1","t_minus_2","T-1","T-2"),
+            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):","mtd","lmtd","MTD","LMTD"),
+        ],
+    )
+    log.info("DAILY CLOSED — %s", subj)
+    from airflow.utils.email import send_email
+    send_email(to=EMAIL_TO, subject=subj, html_content=body)
+
+
+###########################################################################
+#  TEST TASKS — trigger these to force-fire daily emails right now
+###########################################################################
+
+def test_daily_open_mail(**ctx):
+    log.info("TEST — forcing daily open mailer")
+    _do_send_daily_open()
+
+def test_closed_daily_mail(**ctx):
+    log.info("TEST — forcing daily closed mailer")
+    _do_send_closed_daily()
+
+
+###########################################################################
+#  DAG
+###########################################################################
+
+default_args = {"owner": "analytics", "retries": 2, "retry_delay": timedelta(minutes=5)}
 
 dag = DAG(
     dag_id="lending_report",
@@ -1126,63 +793,59 @@ dag = DAG(
     tags=["lending", "report"],
 )
 
-t0  = PythonOperator(task_id="create_lenders",     python_callable=create_lenders,     dag=dag)
-t1  = PythonOperator(task_id="create_base",         python_callable=create_base,         dag=dag)
-t2  = PythonOperator(task_id="create_address",      python_callable=create_address,      dag=dag)
-t3  = PythonOperator(task_id="create_journey",      python_callable=create_journey,      dag=dag)
-t4  = PythonOperator(task_id="create_lender_det",   python_callable=create_lender_det,   dag=dag)
-t5  = PythonOperator(task_id="create_offer",        python_callable=create_offer,        dag=dag)
-t6  = PythonOperator(task_id="create_offer_accept", python_callable=create_offer_accept, dag=dag)
-t7  = PythonOperator(task_id="create_kyc",          python_callable=create_kyc,          dag=dag)
-t8  = PythonOperator(task_id="create_bank",         python_callable=create_bank,         dag=dag)
-t9  = PythonOperator(task_id="create_nach",         python_callable=create_nach,         dag=dag)
-t10 = PythonOperator(task_id="create_sanction",     python_callable=create_sanction,     dag=dag)
-t11 = PythonOperator(task_id="create_drawdown",     python_callable=create_drawdown,     dag=dag)
-t12 = PythonOperator(task_id="create_lenderwise",   python_callable=create_lenderwise,   dag=dag)
-t13 = PythonOperator(task_id="create_overall",      python_callable=create_overall,      dag=dag)
-t14 = PythonOperator(task_id="create_funnel",       python_callable=create_funnel,       dag=dag)
-t15 = PythonOperator(task_id="create_unique_tof",   python_callable=create_unique_tof,   dag=dag)
-t16 = PythonOperator(task_id="create_topline",      python_callable=create_topline,      dag=dag)
-t17 = PythonOperator(task_id="send_hourly_mail",    python_callable=send_hourly_mail,    dag=dag)
-t18 = PythonOperator(task_id="send_daily_mail",     python_callable=send_daily_mail,     dag=dag)
-# t19 = PythonOperator(task_id="cleanup",           python_callable=cleanup,             dag=dag)
+# ── Step tables (shared by open + closed) ────────────────────────────
+t0  = PythonOperator(task_id="create_lenders",      python_callable=create_lenders,      dag=dag)
+t1  = PythonOperator(task_id="create_base",          python_callable=create_base,          dag=dag)
+t2  = PythonOperator(task_id="create_address",       python_callable=create_address,       dag=dag)
+t3  = PythonOperator(task_id="create_journey",       python_callable=create_journey,       dag=dag)
+t4  = PythonOperator(task_id="create_lender_det",    python_callable=create_lender_det,    dag=dag)
+t5  = PythonOperator(task_id="create_offer",         python_callable=create_offer,         dag=dag)
+t6  = PythonOperator(task_id="create_offer_accept",  python_callable=create_offer_accept,  dag=dag)
+t7  = PythonOperator(task_id="create_kyc",           python_callable=create_kyc,           dag=dag)
+t8  = PythonOperator(task_id="create_bank",          python_callable=create_bank,          dag=dag)
+t9  = PythonOperator(task_id="create_nach",          python_callable=create_nach,          dag=dag)
+t10 = PythonOperator(task_id="create_sanction",      python_callable=create_sanction,      dag=dag)
+t11 = PythonOperator(task_id="create_drawdown",      python_callable=create_drawdown,      dag=dag)
 
-# ── Task dependencies ────────────────────────────────────────────────
+# ── Open funnel summaries ────────────────────────────────────────────
+t12 = PythonOperator(task_id="open_lenderwise",      python_callable=create_open_lenderwise,  dag=dag)
+t13 = PythonOperator(task_id="open_overall",         python_callable=create_open_overall,     dag=dag)
+t14 = PythonOperator(task_id="unique_tof",           python_callable=create_unique_tof,       dag=dag)
+
+# ── Closed funnel summaries ──────────────────────────────────────────
+t15 = PythonOperator(task_id="closed_lenderwise",    python_callable=create_closed_lenderwise, dag=dag)
+t16 = PythonOperator(task_id="closed_overall",       python_callable=create_closed_overall,    dag=dag)
+
+# ── Mailers ──────────────────────────────────────────────────────────
+t17 = PythonOperator(task_id="send_hourly_open",     python_callable=send_hourly_mail,         dag=dag)
+t18 = PythonOperator(task_id="send_daily_open",      python_callable=send_daily_open_mail,     dag=dag)
+t19 = PythonOperator(task_id="send_daily_closed",    python_callable=send_closed_daily_mail,   dag=dag)
+
+# ── Test tasks (trigger manually to force-fire daily emails) ─────────
+t20 = PythonOperator(task_id="test_daily_open",      python_callable=test_daily_open_mail,     dag=dag)
+t21 = PythonOperator(task_id="test_daily_closed",    python_callable=test_closed_daily_mail,   dag=dag)
+
+# ── Wiring ───────────────────────────────────────────────────────────
 #
-#  create_lenders → create_base
-#                       │
-#                       ├── create_address ──────────────────────┐
-#                       ├── create_journey ──────────────────────┤
-#                       ├── create_lender_det ───────────────────┤
-#                       ├── create_offer → create_offer_accept ──┤
-#                       ├── create_kyc ──────────────────────────┤
-#                       ├── create_bank ─────────────────────────┤
-#                       ├── create_nach ─────────────────────────┤
-#                       ├── create_sanction ─────────────────────┤
-#                       └── create_drawdown ─────────────────────┤
-#                                                                │
-#                       create_lenderwise ◄──────────────────────┘
-#                           │
-#                           ├── create_overall → create_topline ──┐
-#                           ├── create_funnel ────────────────────┤
-#                           └── create_unique_tof ────────────────┤
-#                                                                 │
-#                           ┌─────────────────────────────────────┘
-#                           ├── send_hourly_mail
-#                           └── send_daily_mail
+#  lenders → base → [address, journey, lender_det, offer→offer_accept,
+#                     kyc, bank, nach, sanction, drawdown]
+#                          │
+#                          ├──► open_lenderwise → open_overall ─┐
+#                          │                                    ├──► send_hourly_open
+#                          │    unique_tof ─────────────────────┤    send_daily_open
+#                          │                                    │
+#                          └──► closed_lenderwise → closed_overall → send_daily_closed
 
 t0 >> t1
-
 t1 >> [t2, t3, t4, t5, t7, t8, t9, t10, t11]
 t5 >> t6
 
-[t2, t3, t4, t6, t7, t8, t9, t10, t11] >> t12
+all_steps = [t2, t3, t4, t6, t7, t8, t9, t10, t11]
 
-t12 >> t13 >> t16
-t12 >> t14
-t12 >> t15
+all_steps >> t12 >> t13
+all_steps >> t14
+all_steps >> t15 >> t16
 
-[t14, t15, t16] >> t17
-[t14, t15, t16] >> t18
-# t17 >> t19
-# t18 >> t19
+[t13, t14] >> t17
+[t13, t14] >> t18
+[t16, t14] >> t19
