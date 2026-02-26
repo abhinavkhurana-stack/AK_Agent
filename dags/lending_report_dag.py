@@ -766,21 +766,58 @@ def _do_send_closed_daily():
 
 
 ###########################################################################
+#  FULL PIPELINE  (used by test tasks to run everything end-to-end)
+###########################################################################
+
+def _run_full_pipeline():
+    """Run every step from scratch: lenders → base → steps → summaries."""
+    log.info("PIPELINE — creating lender ref table")
+    create_lenders()
+
+    log.info("PIPELINE — creating base table")
+    create_base()
+
+    log.info("PIPELINE — creating step tables")
+    create_address()
+    create_journey()
+    create_lender_det()
+    create_offer()
+    create_offer_accept()
+    create_kyc()
+    create_bank()
+    create_nach()
+    create_sanction()
+    create_drawdown()
+
+    log.info("PIPELINE — creating open funnel summaries")
+    create_open_lenderwise()
+    create_open_overall()
+
+    log.info("PIPELINE — creating closed funnel summaries")
+    create_closed_lenderwise()
+    create_closed_overall()
+
+    log.info("PIPELINE — creating unique TOF")
+    create_unique_tof()
+
+    log.info("PIPELINE — done")
+
+
+###########################################################################
 #  TEST TASKS — trigger these to force-fire daily emails right now
+#
+#  These run the FULL pipeline (base → steps → summaries) then send.
+#  Safe to trigger standalone — no upstream dependency needed.
 ###########################################################################
 
 def test_daily_open_mail(**ctx):
-    log.info("TEST — building open summaries + sending")
-    create_open_lenderwise()
-    create_open_overall()
-    create_unique_tof()
+    log.info("TEST — full pipeline + daily open email")
+    _run_full_pipeline()
     _do_send_daily_open()
 
 def test_closed_daily_mail(**ctx):
-    log.info("TEST — building closed summaries + sending")
-    create_closed_lenderwise()
-    create_closed_overall()
-    create_unique_tof()
+    log.info("TEST — full pipeline + daily closed email")
+    _run_full_pipeline()
     _do_send_closed_daily()
 
 
