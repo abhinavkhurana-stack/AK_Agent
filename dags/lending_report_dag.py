@@ -136,20 +136,21 @@ def create_lenders(**ctx):
 ###########################################################################
 
 def create_base(**ctx):
-    w, ws, we, cutoff = compute_windows()
+    w, ws, we, _ = compute_windows()
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_base",
         f"""CREATE TABLE {SCHEMA}.lr_base AS
-            SELECT DISTINCT b.mbkloanid, b.createdat, b.memberid,
-                CASE WHEN prev.memberid IS NULL THEN 'NEW' ELSE 'OLD' END AS user_type
+            SELECT DISTINCT b.mbkloanid, b.createdat, b.memberid, fs.first_seen
             FROM lending.boost b
-            LEFT JOIN (
-                SELECT DISTINCT memberid FROM lending.boost
-                WHERE kycflow='HYBRID_KYC_FLOW' AND createdat < '{cutoff}'
-            ) prev ON b.memberid = prev.memberid
+            INNER JOIN (
+                SELECT memberid, MIN(createdat) AS first_seen
+                FROM lending.boost
+                WHERE kycflow='HYBRID_KYC_FLOW'
+                GROUP BY memberid
+            ) fs ON b.memberid = fs.memberid
             WHERE b.kycflow='HYBRID_KYC_FLOW'
               AND b.createdat >= '{ws}' AND b.createdat < '{we}'""",
-        f"ALTER TABLE {SCHEMA}.lr_base ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(createdat), ADD INDEX idx_ut(user_type)",
+        f"ALTER TABLE {SCHEMA}.lr_base ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(createdat), ADD INDEX idx_fs(first_seen)",
     ])
 
 
@@ -288,7 +289,7 @@ _OPEN_SELECT = """
     SELECT
         '{{wname}}'  AS time_window,
         '{{lname}}'  AS lender,
-        COALESCE(b.user_type, 'ALL') AS user_type,
+        COALESCE(CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END, 'ALL') AS user_type,
 
         COUNT(DISTINCT b.mbkloanid)                                       AS basic_details,
         COUNT(DISTINCT a.mbkloanid)                                       AS address,
@@ -321,7 +322,7 @@ _OPEN_SELECT = """
     LEFT JOIN {sch}.lr_drawdown d ON d.mbkloanid=b.mbkloanid
 
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
-    GROUP BY b.user_type WITH ROLLUP
+    GROUP BY CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END WITH ROLLUP
 """.format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
 
 
@@ -338,7 +339,7 @@ _CLOSED_SELECT = """
     SELECT
         '{{wname}}'  AS time_window,
         '{{lname}}'  AS lender,
-        COALESCE(b.user_type, 'ALL') AS user_type,
+        COALESCE(CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END, 'ALL') AS user_type,
 
         COUNT(DISTINCT b.mbkloanid)  AS basic_details,
         COUNT(DISTINCT a.mbkloanid)  AS address,
@@ -400,7 +401,7 @@ _CLOSED_SELECT = """
     LEFT JOIN {sch}.lr_drawdown d ON d.mbkloanid=b.mbkloanid
 
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
-    GROUP BY b.user_type WITH ROLLUP
+    GROUP BY CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END WITH ROLLUP
 """.format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
 
 
@@ -430,7 +431,9 @@ def _create_summary(table_name, select_template):
     ]
     for lid, lname, _ in LENDER_ROWS:
         for wname, (wstart, wend) in windows.items():
-            sql = select_template.format(wname=wname, lname=lname, lid=lid, wstart=wstart, wend=wend)
+            new_cutoff = wstart[:7] + '-01 00:00:00'
+            sql = select_template.format(wname=wname, lname=lname, lid=lid,
+                                         wstart=wstart, wend=wend, new_cutoff=new_cutoff)
             stmts.append(f"INSERT INTO {SCHEMA}.{table_name} {sql}")
     run_sql(stmts)
 
@@ -697,9 +700,9 @@ def send_hourly_mail(**ctx):
 
 def send_daily_open_mail(**ctx):
     now = datetime.now()
-    if now.hour != DAILY_MAIL_HOUR_IST:
-        log.info("Skipping daily open mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
-        return
+    #if now.hour != DAILY_MAIL_HOUR_IST:
+    #    log.info("Skipping daily open mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
+    #    return
     _do_send_daily_open()
 
 def _do_send_daily_open():
@@ -734,9 +737,9 @@ def _do_send_daily_open():
 
 def send_closed_daily_mail(**ctx):
     now = datetime.now()
-    if now.hour != DAILY_MAIL_HOUR_IST:
-        log.info("Skipping daily closed mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
-        return
+    #if now.hour != DAILY_MAIL_HOUR_IST:
+    #    log.info("Skipping daily closed mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
+    #    return
     _do_send_closed_daily()
 
 def _do_send_closed_daily():
@@ -828,7 +831,7 @@ def test_closed_daily_mail(**ctx):
 default_args = {"owner": "analytics", "retries": 2, "retry_delay": timedelta(minutes=5)}
 
 dag = DAG(
-    dag_id="lending_report",
+    dag_id="20260224_Daily_Lending_Summary_BBK_EMI",
     start_date=datetime(2025, 1, 1),
     schedule_interval="@hourly",
     catchup=False,
