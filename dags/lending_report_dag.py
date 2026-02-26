@@ -73,11 +73,11 @@ def get_engine():
 
 def run_sql(statements):
     engine = get_engine()
-    with engine.begin() as conn:
-        for s in statements:
-            s = s.strip()
-            if s:
-                log.info("SQL > %s", s[:200].replace("\n", " "))
+    for s in statements:
+        s = s.strip()
+        if s:
+            log.info("SQL > %s", s[:200].replace("\n", " "))
+            with engine.begin() as conn:
                 conn.execute(sa.text(s))
 
 
