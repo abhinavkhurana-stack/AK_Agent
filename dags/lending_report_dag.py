@@ -129,7 +129,6 @@ LENDER_ROWS = [
     # (50, "DistPartner", "DISTRIBUTION"),← distribution lenders need INSERT blocks too
 ]
 
-DAILY_MAIL_HOUR = 7   # send daily mailer when the DAG runs at this hour (UTC)
 AMOUNT_DIVISOR = 1e7  # divide amounts by this to get ₹ Crores
 
 EMAIL_TO = ["abhinav.khurana@mobikwik.com"]
@@ -897,10 +896,6 @@ def send_hourly_mail(**ctx):
 ###########################################################################
 
 def send_daily_mail(**ctx):
-    if datetime.now().hour != DAILY_MAIL_HOUR:
-        log.info("Skipping daily mailer (current hour != %s)", DAILY_MAIL_HOUR)
-        return
-
     engine = get_engine()
     import pandas as pd
 
