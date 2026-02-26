@@ -132,6 +132,8 @@ LENDER_ROWS = [
 DAILY_MAIL_HOUR = 7   # send daily mailer when the DAG runs at this hour (UTC)
 AMOUNT_DIVISOR = 1e7  # divide amounts by this to get ₹ Crores
 
+EMAIL_TO = ["abhinav.khurana@mobikwik.com"]
+
 
 ###########################################################################
 #  DATABASE
@@ -815,20 +817,27 @@ def create_topline(**ctx):
 ###########################################################################
 
 def send_hourly_mail(**ctx):
-    """
-    Reads summary tables and formats the hourly report.
-
-    Replace the log.info calls with your email sending logic
-    (e.g. Airflow EmailOperator, SMTP, etc.).
-    """
     engine = get_engine()
     import pandas as pd
 
     hourly_windows = ("today", "yesterday", "mtd", "lmtd")
+    now = datetime.now()
 
-    overall = pd.read_sql(
+    funnel_overall = pd.read_sql(
+        f"""SELECT step_name, step_count, pct_of_tof, pct_of_prev
+            FROM {SCHEMA}.lr_funnel
+            WHERE lender = (SELECT lender FROM {SCHEMA}.lr_lenderwise LIMIT 1)
+              AND user_type = 'ALL' AND time_window = 'today'
+            ORDER BY FIELD(step_name,
+                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
+                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
+                'Lender Details','Offer','Offer Accepted','KYC','Bank',
+                'NACH','Sanction','Drawdown')""",
+        engine,
+    )
+    overall_row = pd.read_sql(
         f"""SELECT * FROM {SCHEMA}.lr_overall
-            WHERE user_type = 'ALL' AND time_window IN {hourly_windows}""",
+            WHERE user_type = 'ALL' AND time_window = 'today'""",
         engine,
     )
     lenderwise = pd.read_sql(
@@ -836,9 +845,14 @@ def send_hourly_mail(**ctx):
             WHERE user_type = 'ALL' AND time_window IN {hourly_windows}""",
         engine,
     )
-    topline = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_topline
-            WHERE comparison IN ('Today vs Yesterday', 'MTD vs LMTD')""",
+    funnel_lenderwise = pd.read_sql(
+        f"""SELECT * FROM {SCHEMA}.lr_funnel
+            WHERE user_type = 'ALL' AND time_window = 'today'
+            ORDER BY lender, FIELD(step_name,
+                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
+                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
+                'Lender Details','Offer','Offer Accepted','KYC','Bank',
+                'NACH','Sanction','Drawdown')""",
         engine,
     )
     unique_tof = pd.read_sql(
@@ -846,25 +860,42 @@ def send_hourly_mail(**ctx):
             WHERE time_window IN {hourly_windows}""",
         engine,
     )
-
-    subject = f"Hourly Lending Report — {datetime.now().strftime('%d-%b-%Y %H:%M')}"
-    body = _format_report_html(
-        title="HOURLY LENDING REPORT",
-        overall=overall,
-        lenderwise=lenderwise,
-        topline=topline,
-        unique_tof=unique_tof,
+    topline_today_yest = pd.read_sql(
+        f"""SELECT * FROM {SCHEMA}.lr_topline
+            WHERE comparison = 'Today vs Yesterday'""",
+        engine,
     )
-    log.info("HOURLY MAILER\n%s", subject)
-    log.info("Body preview:\n%s", body[:2000])
+    topline_mtd = pd.read_sql(
+        f"""SELECT * FROM {SCHEMA}.lr_topline
+            WHERE comparison = 'MTD vs LMTD'""",
+        engine,
+    )
 
-    # ── SEND EMAIL HERE ──
-    # from airflow.utils.email import send_email
-    # send_email(to=['team@company.com'], subject=subject, html_content=body)
+    subject = (
+        f"Hourly Lending Summary - EMI BBK "
+        f"| {now.strftime('%d-%b-%Y %I:%M %p')}"
+    )
+    body = _build_email_html(
+        report_type="hourly",
+        now=now,
+        overall_row=overall_row,
+        funnel_overall=funnel_overall,
+        lenderwise=lenderwise,
+        funnel_lenderwise=funnel_lenderwise,
+        unique_tof=unique_tof,
+        topline_pairs=[
+            ("Today vs Yesterday Topline Summary (Amounts in ₹ Cr)", topline_today_yest),
+            ("MTD vs LMTD Topline Summary (Amounts in ₹ Cr)", topline_mtd),
+        ],
+    )
+
+    log.info("HOURLY MAILER — %s", subject)
+    from airflow.utils.email import send_email
+    send_email(to=EMAIL_TO, subject=subject, html_content=body)
 
 
 ###########################################################################
-#  STEP 18 — DAILY MAILER  (conditional — runs only at DAILY_MAIL_HOUR)
+#  STEP 18 — DAILY MAILER  (fires once per day at DAILY_MAIL_HOUR)
 ###########################################################################
 
 def send_daily_mail(**ctx):
@@ -876,10 +907,23 @@ def send_daily_mail(**ctx):
     import pandas as pd
 
     daily_windows = ("t_minus_1", "t_minus_2", "mtd", "lmtd")
+    now = datetime.now()
 
-    overall = pd.read_sql(
+    funnel_overall = pd.read_sql(
+        f"""SELECT step_name, step_count, pct_of_tof, pct_of_prev
+            FROM {SCHEMA}.lr_funnel
+            WHERE lender = (SELECT lender FROM {SCHEMA}.lr_lenderwise LIMIT 1)
+              AND user_type = 'ALL' AND time_window = 't_minus_1'
+            ORDER BY FIELD(step_name,
+                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
+                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
+                'Lender Details','Offer','Offer Accepted','KYC','Bank',
+                'NACH','Sanction','Drawdown')""",
+        engine,
+    )
+    overall_row = pd.read_sql(
         f"""SELECT * FROM {SCHEMA}.lr_overall
-            WHERE user_type = 'ALL' AND time_window IN {daily_windows}""",
+            WHERE user_type = 'ALL' AND time_window = 't_minus_1'""",
         engine,
     )
     lenderwise = pd.read_sql(
@@ -887,9 +931,14 @@ def send_daily_mail(**ctx):
             WHERE user_type = 'ALL' AND time_window IN {daily_windows}""",
         engine,
     )
-    topline = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_topline
-            WHERE comparison IN ('T-1 vs T-2', 'MTD vs LMTD')""",
+    funnel_lenderwise = pd.read_sql(
+        f"""SELECT * FROM {SCHEMA}.lr_funnel
+            WHERE user_type = 'ALL' AND time_window = 't_minus_1'
+            ORDER BY lender, FIELD(step_name,
+                'Basic Details','Address','LPA Run','LPA Pass','Pre BRE',
+                'Bureau Pull','BRE Success','Post BRE','PAN Validation',
+                'Lender Details','Offer','Offer Accepted','KYC','Bank',
+                'NACH','Sanction','Drawdown')""",
         engine,
     )
     unique_tof = pd.read_sql(
@@ -897,63 +946,263 @@ def send_daily_mail(**ctx):
             WHERE time_window IN {daily_windows}""",
         engine,
     )
-
-    subject = f"Daily Lending Report — {datetime.now().strftime('%d-%b-%Y')}"
-    body = _format_report_html(
-        title="DAILY LENDING REPORT",
-        overall=overall,
-        lenderwise=lenderwise,
-        topline=topline,
-        unique_tof=unique_tof,
+    topline_t1_t2 = pd.read_sql(
+        f"""SELECT * FROM {SCHEMA}.lr_topline
+            WHERE comparison = 'T-1 vs T-2'""",
+        engine,
     )
-    log.info("DAILY MAILER\n%s", subject)
-    log.info("Body preview:\n%s", body[:2000])
+    topline_mtd = pd.read_sql(
+        f"""SELECT * FROM {SCHEMA}.lr_topline
+            WHERE comparison = 'MTD vs LMTD'""",
+        engine,
+    )
 
-    # ── SEND EMAIL HERE ──
-    # from airflow.utils.email import send_email
-    # send_email(to=['team@company.com'], subject=subject, html_content=body)
+    t1_date = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+    subject = (
+        f"Daily Lending Summary - EMI BBK "
+        f"| {t1_date}"
+    )
+    body = _build_email_html(
+        report_type="daily",
+        now=now,
+        overall_row=overall_row,
+        funnel_overall=funnel_overall,
+        lenderwise=lenderwise,
+        funnel_lenderwise=funnel_lenderwise,
+        unique_tof=unique_tof,
+        topline_pairs=[
+            (f"T-1 ({t1_date}) vs T-2 Topline Summary (Amounts in ₹ Cr)", topline_t1_t2),
+            ("MTD vs LMTD Topline Summary (Amounts in ₹ Cr)", topline_mtd),
+        ],
+    )
+
+    log.info("DAILY MAILER — %s", subject)
+    from airflow.utils.email import send_email
+    send_email(to=EMAIL_TO, subject=subject, html_content=body)
 
 
 ###########################################################################
-#  EMAIL HTML FORMATTER
+#  EMAIL HTML BUILDER
 ###########################################################################
 
-def _format_report_html(title, overall, lenderwise, topline, unique_tof):
-    """Build a simple HTML email body from dataframes."""
-    css = """
-    <style>
-        body { font-family: Calibri, Arial, sans-serif; font-size: 13px; }
-        h2   { color: #2c3e50; }
-        h3   { color: #2980b9; margin-top: 24px; }
-        table { border-collapse: collapse; margin-bottom: 20px; }
-        th    { background: #2c3e50; color: #fff; padding: 6px 12px; text-align: right; }
-        td    { border: 1px solid #ddd; padding: 6px 12px; text-align: right; }
-        tr:nth-child(even) { background: #f2f2f2; }
-        td:first-child, th:first-child { text-align: left; }
-    </style>
+_EMAIL_CSS = """
+<style>
+    body   { font-family: Calibri, Arial, sans-serif; font-size: 12px;
+             color: #222; margin: 0; padding: 16px; background: #f7f7f7; }
+    .wrap  { max-width: 960px; margin: 0 auto; background: #fff;
+             padding: 20px 24px; border: 1px solid #ddd; }
+    h2     { font-size: 16px; color: #1a3c5e; margin: 0 0 4px 0; }
+    .sub   { font-size: 11px; color: #666; margin-bottom: 18px; }
+    h3     { font-size: 13px; color: #fff; background: #2980b9;
+             padding: 6px 10px; margin: 22px 0 0 0; }
+    h3.grn { background: #27ae60; }
+    h3.org { background: #e67e22; }
+    h3.prp { background: #8e44ad; }
+    table  { border-collapse: collapse; width: 100%; margin-bottom: 2px; }
+    th     { background: #34495e; color: #fff; font-weight: 600;
+             padding: 5px 10px; text-align: right; font-size: 11px;
+             border: 1px solid #2c3e50; white-space: nowrap; }
+    td     { padding: 4px 10px; text-align: right; font-size: 11px;
+             border: 1px solid #ccc; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    tr:nth-child(even) td { background: #f4f8fb; }
+    tr.amt td { border-top: 2px solid #34495e; font-weight: 700; }
+    .note  { font-size: 10px; color: #888; margin: 2px 0 14px 0; }
+    .pos   { color: #27ae60; }
+    .neg   { color: #c0392b; }
+</style>
+"""
+
+
+def _fc(val):
+    """Format count with Indian-style commas."""
+    try:
+        n = int(val)
+        if n < 0:
+            return f"-{_fc(-n)}"
+        s = str(n)
+        if len(s) <= 3:
+            return s
+        last3 = s[-3:]
+        rest = s[:-3]
+        parts = []
+        while rest:
+            parts.append(rest[-2:])
+            rest = rest[:-2]
+        return ",".join(reversed(parts)) + "," + last3
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _fa(val):
+    """Format amount (₹ Cr) to 2 decimals."""
+    try:
+        return f"{float(val):,.2f}"
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _fp(val):
+    """Format percentage."""
+    try:
+        v = float(val)
+        return f"{v:.2f}%"
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _fpchange(val):
+    """Format % change with colour class."""
+    try:
+        v = float(val)
+        cls = "pos" if v >= 0 else "neg"
+        sign = "+" if v >= 0 else ""
+        return f'<span class="{cls}">{sign}{v:.2f}%</span>'
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _funnel_table_html(funnel_df, amounts_row=None):
     """
+    Build an HTML funnel table from lr_funnel rows.
+    Columns: Particulars | Count | % of TOF | % of Prev Step
+    Optionally appends Sanction Amt and Drawdown Amt rows.
+    """
+    rows = []
+    for _, r in funnel_df.iterrows():
+        rows.append(
+            f"<tr><td>{r['step_name']}</td>"
+            f"<td>{_fc(r['step_count'])}</td>"
+            f"<td>{_fp(r['pct_of_tof'])}</td>"
+            f"<td>{_fp(r['pct_of_prev'])}</td></tr>"
+        )
 
-    def df_to_html(df):
-        if df.empty:
-            return "<p><em>No data</em></p>"
-        return df.to_html(index=False, border=0, na_rep="—")
+    if amounts_row is not None and not amounts_row.empty:
+        row = amounts_row.iloc[0]
+        rows.append(
+            f'<tr class="amt"><td>Sanction Amount (₹ Cr)</td>'
+            f"<td>{_fa(row.get('sanction_amt_cr', 0))}</td>"
+            f"<td></td><td></td></tr>"
+        )
+        rows.append(
+            f'<tr class="amt"><td>Drawdown Amount (₹ Cr)</td>'
+            f"<td>{_fa(row.get('drawdown_amt_cr', 0))}</td>"
+            f"<td></td><td></td></tr>"
+        )
 
-    sections = [
-        f"<h2>{title} — {datetime.now().strftime('%d-%b-%Y %H:%M')}</h2>",
-        "<h3>Overall Summary</h3>",
-        df_to_html(overall),
-        "<h3>Unique User TOF Summary</h3>",
-        df_to_html(unique_tof),
-        "<h3>Topline Comparison (Amounts in ₹ Cr)</h3>",
-        df_to_html(topline),
+    return (
+        "<table>"
+        "<tr><th>Particulars</th><th>Count</th>"
+        "<th>% of TOF</th><th>% of Prev Step</th></tr>"
+        + "".join(rows)
+        + "</table>"
+    )
+
+
+def _topline_table_html(topline_df):
+    """Build comparison table: Metric | Period A | Period B | % Change."""
+    if topline_df.empty:
+        return "<p><em>No data</em></p>"
+
+    pa_label = topline_df.iloc[0]["period_a"]
+    pb_label = topline_df.iloc[0]["period_b"]
+
+    header = (
+        f"<tr><th>Metric</th><th>{pa_label}</th>"
+        f"<th>{pb_label}</th><th>% Change</th></tr>"
+    )
+    rows = []
+    for _, r in topline_df.iterrows():
+        is_amt = "Amount" in str(r["metric"])
+        fmt = _fa if is_amt else _fc
+        rows.append(
+            f"<tr><td>{r['metric']}</td>"
+            f"<td>{fmt(r['value_a'])}</td>"
+            f"<td>{fmt(r['value_b'])}</td>"
+            f"<td>{_fpchange(r['pct_change'])}</td></tr>"
+        )
+    return f"<table>{header}{''.join(rows)}</table>"
+
+
+def _unique_tof_table_html(tof_df):
+    if tof_df.empty:
+        return "<p><em>No data</em></p>"
+    header = "<tr><th>Time Window</th><th>Unique Users</th><th>Unique Applications</th></tr>"
+    rows = []
+    for _, r in tof_df.iterrows():
+        rows.append(
+            f"<tr><td>{r['time_window']}</td>"
+            f"<td>{_fc(r['unique_users'])}</td>"
+            f"<td>{_fc(r['unique_applications'])}</td></tr>"
+        )
+    return f"<table>{header}{''.join(rows)}</table>"
+
+
+def _build_email_html(
+    report_type,
+    now,
+    overall_row,
+    funnel_overall,
+    lenderwise,
+    funnel_lenderwise,
+    unique_tof,
+    topline_pairs,
+):
+    """
+    Assemble the full HTML email.
+
+    Sections (matching the shared Excel format):
+      1. Overall Summary  (funnel + amounts)
+      2. Lenderwise Summary — <Lender>  (one per lender)
+      3. Unique User TOF Summary
+      4. Today vs Yesterday / T-1 vs T-2 Topline (Amounts in ₹ Cr)
+      5. MTD vs LMTD Topline (Amounts in ₹ Cr)
+    """
+    if report_type == "hourly":
+        title = "Hourly Lending Summary - EMI BBK"
+        ts = now.strftime("%d-%b-%Y %I:%M %p")
+    else:
+        t1 = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+        title = "Daily Lending Summary - EMI BBK"
+        ts = t1
+
+    parts = [
+        _EMAIL_CSS,
+        '<div class="wrap">',
+        f"<h2>{title}</h2>",
+        f'<div class="sub">{ts}</div>',
     ]
 
-    for lender_name in lenderwise["lender"].unique():
-        ldf = lenderwise[lenderwise["lender"] == lender_name]
-        sections.append(f"<h3>Lenderwise Summary — {lender_name}</h3>")
-        sections.append(df_to_html(ldf.drop(columns=["lender"])))
+    # ── 1. Overall Summary ───────────────────────────────────────────
+    parts.append('<h3>Overall Summary</h3>')
+    parts.append(
+        '<div class="note">'
+        "All particulars are taken as per user instances — "
+        "multiple journeys from same user is expected"
+        "</div>"
+    )
+    parts.append(_funnel_table_html(funnel_overall, amounts_row=overall_row))
 
-    return f"<html><head>{css}</head><body>{''.join(sections)}</body></html>"
+    # ── 2. Lenderwise Summary ────────────────────────────────────────
+    if not funnel_lenderwise.empty:
+        for lender_name in funnel_lenderwise["lender"].unique():
+            lf = funnel_lenderwise[funnel_lenderwise["lender"] == lender_name]
+            lw_row = lenderwise[lenderwise["lender"] == lender_name].head(1)
+
+            parts.append(f'<h3 class="grn">Lenderwise Summary — {lender_name}</h3>')
+            parts.append(_funnel_table_html(lf, amounts_row=lw_row))
+
+    # ── 3. Unique User TOF ──────────────────────────────────────────
+    parts.append('<h3 class="prp">Unique User TOF Summary</h3>')
+    parts.append(_unique_tof_table_html(unique_tof))
+
+    # ── 4 & 5. Topline Comparisons ──────────────────────────────────
+    for section_title, tl_df in topline_pairs:
+        parts.append(f'<h3 class="org">{section_title}</h3>')
+        parts.append(_topline_table_html(tl_df))
+
+    parts.append("</div>")
+    return f"<html><head></head><body>{''.join(parts)}</body></html>"
 
 
 ###########################################################################
