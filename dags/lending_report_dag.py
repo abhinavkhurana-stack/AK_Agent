@@ -133,6 +133,8 @@ AMOUNT_DIVISOR = 1e7  # divide amounts by this to get ₹ Crores
 
 EMAIL_TO = ["abhinav.khurana@mobikwik.com"]
 
+DAILY_MAIL_HOUR_IST = 9  # daily mailer fires when IST hour == 9 (i.e. 9:00–9:59 AM)
+
 
 ###########################################################################
 #  DATABASE
@@ -866,158 +868,111 @@ def send_hourly_mail(**ctx):
     import pandas as pd
 
     now = datetime.now()
-    overall = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
+    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
     unique_tof = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_unique_tof
-            WHERE time_window IN ('today','yesterday','mtd','lmtd')""",
-        engine,
-    )
+        f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('today','yesterday','mtd','lmtd')", engine)
 
-    subject = (
-        f"Hourly Lending Summary - EMI BBK "
-        f"| {now.strftime('%d-%b-%Y %I:%M %p')}"
-    )
-    body = _build_full_email(
-        report_type="hourly",
-        now=now,
-        overall=overall,
-        lenderwise=lenderwise,
-        unique_tof=unique_tof,
-    )
+    windows  = ["today", "mtd", "lmtd"]
+    wlabels  = {"today": "YTD", "mtd": "MTD", "lmtd": "LMTD"}
+    utypes   = [("ALL", "Overall"), ("OLD", "Repeat"), ("NEW", "New")]
 
-    log.info("HOURLY MAILER — %s", subject)
+    Top_Yest      = _make_topline_df(lenderwise, overall, "today", "yesterday", "TTN", "YTN")
+    Top_MTD_LMTD  = _make_topline_df(lenderwise, overall, "mtd", "lmtd", "MTD", "LMTD")
+    Overall       = _make_funnel_df(overall, windows, wlabels, utypes)
+    Unique        = unique_tof[["time_window", "unique_users", "unique_applications"]]
+
+    subj = f"Hourly Lending Summary - EMI BBK || {now.strftime('%d-%b-%Y %I:%M %p')}"
+    body = _html_head()
+    body += "<p>Hi Team,<br>Please find the summary below:</p>\n"
+    body += "<h3>Today vs Yesterday Topline Summary:</h3>\n"
+    body += Top_Yest.to_html(index=False)
+    body += "<h3>MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):</h3>\n"
+    body += Top_MTD_LMTD.to_html(index=False)
+    body += "<h3>Unique User TOF Summary:</h3>\n"
+    body += Unique.to_html(index=False)
+    body += "<h3>Overall Summary: [** All Particulars are taken as per user instances- multiple journeys from same user is expected]</h3>\n"
+    body += Overall.to_html(index=False)
+    for lname in sorted(lenderwise["lender"].unique()):
+        ldf = lenderwise[lenderwise["lender"] == lname]
+        body += f"<h3>Lenderwise Summary - {lname}:</h3>\n"
+        body += _make_funnel_df(ldf, windows, wlabels, utypes).to_html(index=False) + "\n"
+    body += "</body>\n</html>"
+
+    log.info("HOURLY MAILER — %s", subj)
     from airflow.utils.email import send_email
-    send_email(to=EMAIL_TO, subject=subject, html_content=body)
+    send_email(to=EMAIL_TO, subject=subj, html_content=body)
 
 
 ###########################################################################
-#  STEP 18 — DAILY MAILER  (fires once per day at DAILY_MAIL_HOUR)
+#  STEP 18 — DAILY MAILER  (once per day at 9 AM IST)
 ###########################################################################
 
 def send_daily_mail(**ctx):
+    # ── TESTING: comment out the next 3 lines to force-fire now ──────
+    now = datetime.now()
+    if now.hour != DAILY_MAIL_HOUR_IST:
+        log.info("Skipping daily mailer (IST hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
+        return
+    # ─────────────────────────────────────────────────────────────────
+
     engine = get_engine()
     import pandas as pd
 
     now = datetime.now()
-    overall = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
+    overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
     unique_tof = pd.read_sql(
-        f"""SELECT * FROM {SCHEMA}.lr_unique_tof
-            WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')""",
-        engine,
-    )
+        f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')", engine)
 
-    t1_date = (now - timedelta(days=1)).strftime("%d-%b-%Y")
-    subject = f"Daily Lending Summary - EMI BBK | {t1_date}"
-    body = _build_full_email(
-        report_type="daily",
-        now=now,
-        overall=overall,
-        lenderwise=lenderwise,
-        unique_tof=unique_tof,
-    )
+    windows  = ["t_minus_1", "mtd", "lmtd"]
+    wlabels  = {"t_minus_1": "T-1", "mtd": "MTD", "lmtd": "LMTD"}
+    utypes   = [("ALL", "Overall"), ("OLD", "Repeat"), ("NEW", "New")]
 
-    log.info("DAILY MAILER — %s", subject)
+    t1_date       = (now - timedelta(days=1)).strftime("%d-%b-%Y")
+    Top_Yest      = _make_topline_df(lenderwise, overall, "t_minus_1", "t_minus_2", "T-1", "T-2")
+    Top_MTD_LMTD  = _make_topline_df(lenderwise, overall, "mtd", "lmtd", "MTD", "LMTD")
+    Overall       = _make_funnel_df(overall, windows, wlabels, utypes)
+    Unique        = unique_tof[["time_window", "unique_users", "unique_applications"]]
+
+    subj = f"Daily Lending Summary - EMI BBK || {t1_date}"
+    body = _html_head()
+    body += "<p>Hi Team,<br>Please find the summary below:</p>\n"
+    body += "<h3>T-1 Vs T-2 Topline Summary (Amounts are in ₹ Cr):</h3>\n"
+    body += Top_Yest.to_html(index=False)
+    body += "<h3>MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):</h3>\n"
+    body += Top_MTD_LMTD.to_html(index=False)
+    body += "<h3>Unique User TOF Summary:</h3>\n"
+    body += Unique.to_html(index=False)
+    body += "<h3>Overall Summary: [** All Particulars are taken as per user instances- multiple journeys from same user is expected]</h3>\n"
+    body += Overall.to_html(index=False)
+    for lname in sorted(lenderwise["lender"].unique()):
+        ldf = lenderwise[lenderwise["lender"] == lname]
+        body += f"<h3>Lenderwise Summary - {lname}:</h3>\n"
+        body += _make_funnel_df(ldf, windows, wlabels, utypes).to_html(index=False) + "\n"
+    body += "</body>\n</html>"
+
+    log.info("DAILY MAILER — %s", subj)
     from airflow.utils.email import send_email
-    send_email(to=EMAIL_TO, subject=subject, html_content=body)
+    send_email(to=EMAIL_TO, subject=subj, html_content=body)
 
 
 ###########################################################################
-#  EMAIL HTML BUILDER
+#  EMAIL HELPERS  (simple — just build DataFrames, use .to_html())
 ###########################################################################
 
-_EMAIL_CSS = """
-<style>
-    body   { font-family: Calibri, Arial, sans-serif; font-size: 11px;
-             color: #222; margin: 0; padding: 12px; background: #f5f5f5; }
-    .wrap  { max-width: 1200px; margin: 0 auto; background: #fff;
-             padding: 16px 18px; border: 1px solid #ccc; }
-    h2     { font-size: 15px; color: #1a3c5e; margin: 0 0 4px 0; }
-    .sub   { font-size: 10px; color: #666; margin-bottom: 14px; }
-    h3     { font-size: 12px; color: #000; background: #d5e8d4;
-             padding: 5px 8px; margin: 18px 0 0 0;
-             border: 1px solid #82b366; }
-    h3.tl  { background: #dae8fc; border-color: #6c8ebf; }
-    h3.tof { background: #e1d5e7; border-color: #9673a6; }
-    table  { border-collapse: collapse; width: 100%; margin-bottom: 4px; }
-    th     { background: #d9d9d9; color: #000; font-weight: 700;
-             padding: 4px 8px; text-align: right; font-size: 10px;
-             border: 1px solid #999; white-space: nowrap; }
-    td     { padding: 3px 8px; text-align: right; font-size: 10px;
-             border: 1px solid #bbb; white-space: nowrap; }
-    th:first-child, td:first-child { text-align: left; min-width: 220px; }
-    tr.pct td { color: #555; font-style: italic; background: #fafafa; }
-    tr.amt td { border-top: 2px solid #666; font-weight: 700; }
-    .note  { font-size: 9px; color: #888; margin: 2px 0 8px 0; }
-    .pos   { color: #006100; }
-    .neg   { color: #c00000; }
-</style>
-"""
+def _html_head():
+    return (
+        "<html>\n<head>\n<style>\n"
+        "body { font-family: Arial, sans-serif; }\n"
+        "table { width: 100%; border-collapse: collapse; }\n"
+        "th, td { border: 1px solid black; padding: 8px; text-align: left; }\n"
+        "th { background-color: #f2f2f2; }\n"
+        "</style>\n</head>\n<body>\n"
+    )
 
-
-def _fc(val):
-    """Format count with Indian-style commas."""
-    try:
-        n = int(round(float(val)))
-        if n < 0:
-            return f"-{_fc(-n)}"
-        s = str(n)
-        if len(s) <= 3:
-            return s
-        last3 = s[-3:]
-        rest = s[:-3]
-        parts = []
-        while rest:
-            parts.append(rest[-2:])
-            rest = rest[:-2]
-        return ",".join(reversed(parts)) + "," + last3
-    except (ValueError, TypeError):
-        return ""
-
-
-def _fa(val):
-    """Format amount to 2 decimals."""
-    try:
-        v = float(val)
-        if v == 0:
-            return ""
-        return f"{v:,.2f}"
-    except (ValueError, TypeError):
-        return ""
-
-
-def _fpct(num, den):
-    """Compute and format a percentage (num / den × 100)."""
-    try:
-        n = float(num or 0)
-        d = float(den or 0)
-        if d == 0:
-            return ""
-        return f"{n / d * 100:.2f}%"
-    except (ValueError, TypeError):
-        return ""
-
-
-def _fpchange(va, vb):
-    """Format percentage change with colour."""
-    try:
-        a = float(va or 0)
-        b = float(vb or 0)
-        if b == 0:
-            return "None" if a == 0 else "—"
-        pct = (a - b) / b * 100
-        cls = "pos" if pct >= 0 else "neg"
-        sign = "+" if pct >= 0 else ""
-        return f'<span class="{cls}">{sign}{pct:.2f}%</span>'
-    except (ValueError, TypeError):
-        return "—"
-
-
-# ── Lookup helper ────────────────────────────────────────────────────
 
 def _make_lookup(df):
-    """Turn a summary DataFrame into {(time_window, user_type): Series}."""
     lk = {}
     for _, row in df.iterrows():
         lk[(row["time_window"], row["user_type"])] = row
@@ -1025,198 +980,115 @@ def _make_lookup(df):
 
 
 def _val(lookup, tw, ut, col):
-    """Safely get a value from the lookup."""
     row = lookup.get((tw, ut))
     if row is None:
         return 0
-    v = row.get(col, 0)
     try:
+        v = row.get(col, 0)
         return float(v) if v is not None else 0
     except (ValueError, TypeError):
         return 0
 
 
-# ── Funnel (Overall / Lenderwise summary) ────────────────────────────
+def _fc(v):
+    """Indian-style commas."""
+    try:
+        n = int(round(float(v)))
+        s = str(abs(n))
+        if len(s) <= 3:
+            return ("-" + s) if n < 0 else s
+        last3, rest = s[-3:], s[:-3]
+        parts = []
+        while rest:
+            parts.append(rest[-2:]); rest = rest[:-2]
+        formatted = ",".join(reversed(parts)) + "," + last3
+        return ("-" + formatted) if n < 0 else formatted
+    except (ValueError, TypeError):
+        return ""
 
-def _build_funnel_html(df, windows, wlabels, utypes):
-    """
-    Build the interleaved funnel table matching the Excel grid.
 
-    Columns:  Particular | w1_ut1 | w2_ut1 | w3_ut1 | w1_ut2 | … | w3_ut3
-    Rows:     count rows interleaved with '% X_from_Y' percentage rows
-    """
-    lk = _make_lookup(df)
+def _fa(v):
+    try:
+        f = float(v)
+        return f"{f:.2f}" if f else ""
+    except (ValueError, TypeError):
+        return ""
 
-    col_headers = []
-    col_keys = []
+
+def _fpct(num, den):
+    try:
+        n, d = float(num or 0), float(den or 0)
+        return f"{n/d*100:.2f}%" if d else ""
+    except (ValueError, TypeError):
+        return ""
+
+
+def _pct_change(a, b):
+    try:
+        a, b = float(a or 0), float(b or 0)
+        if b == 0:
+            return "None" if a == 0 else ""
+        return f"{(a-b)/b*100:.2f}%"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _make_funnel_df(summary_df, windows, wlabels, utypes):
+    """Build the interleaved funnel DataFrame (rows = steps + % rows, cols = window × user_type)."""
+    import pandas as pd
+    lk = _make_lookup(summary_df)
+
+    col_names = ["Particular"]
+    col_keys  = []
     for ut_key, ut_label in utypes:
         for wk in windows:
-            col_headers.append(f"{wlabels[wk]}_{ut_label}")
+            col_names.append(f"{wlabels[wk]}_{ut_label}")
             col_keys.append((wk, ut_key))
-
-    header = (
-        "<tr><th>Particular</th>"
-        + "".join(f"<th>{h}</th>" for h in col_headers)
-        + "</tr>"
-    )
 
     rows = []
     for label, val_col, pct_num, pct_den in _FUNNEL_DISPLAY:
-        is_pct = val_col is None
-        is_amt = (val_col or "").endswith("_amt_cr")
-
-        cells = []
+        row = [label]
         for wk, ut in col_keys:
-            if is_pct:
-                cells.append(_fpct(_val(lk, wk, ut, pct_num),
-                                   _val(lk, wk, ut, pct_den)))
-            elif is_amt:
-                cells.append(_fa(_val(lk, wk, ut, val_col)))
+            if val_col is None:
+                row.append(_fpct(_val(lk, wk, ut, pct_num), _val(lk, wk, ut, pct_den)))
+            elif val_col.endswith("_amt_cr"):
+                row.append(_fa(_val(lk, wk, ut, val_col)))
             else:
                 v = _val(lk, wk, ut, val_col)
-                cells.append(_fc(v) if v else "")
+                row.append(_fc(v) if v else "")
+        rows.append(row)
 
-        cls = ""
-        if is_pct:
-            cls = ' class="pct"'
-        elif is_amt:
-            cls = ' class="amt"'
-
-        rows.append(
-            f"<tr{cls}><td>{label}</td>"
-            + "".join(f"<td>{c}</td>" for c in cells)
-            + "</tr>"
-        )
-
-    return f"<table>{header}{''.join(rows)}</table>"
+    return pd.DataFrame(rows, columns=col_names)
 
 
-# ── Topline (per-lender: Today vs Yesterday / MTD vs LMTD) ──────────
-
-def _build_topline_html(lenderwise, overall, pa_key, pb_key, pa_lbl, pb_lbl):
-    """
-    One row per lender.  Columns:
-    Lender | Drawdown_A | Drawdown_B | Drawdown_Chg |
-            Sanction_A | Sanction_B | Sanction_Chg |
-            Offer_Gen_A| Offer_Gen_B| Offer_Gen_Chg
-    """
+def _make_topline_df(lenderwise, overall, pa_key, pb_key, pa_lbl, pb_lbl):
+    """Build per-lender topline DataFrame (one row per lender, metrics as columns)."""
+    import pandas as pd
     metrics = [
         ("Drawdown", "drawdown_amt_cr", True),
         ("Sanction", "sanction_amt_cr", True),
         ("Offer_Gen", "offer", False),
     ]
 
-    heads = ["<th>Lender</th>"]
-    for mname, _, _ in metrics:
-        heads.append(f"<th>{mname}_{pa_lbl}</th>")
-        heads.append(f"<th>{mname}_{pb_lbl}</th>")
-        heads.append(f"<th>{mname}_Change</th>")
-    header = "<tr>" + "".join(heads) + "</tr>"
+    col_names = ["Lender"]
+    for m, _, _ in metrics:
+        col_names += [f"{m}_{pa_lbl}", f"{m}_{pb_lbl}", f"{m}_Change"]
 
-    def _row(label, df_src):
-        lk = _make_lookup(df_src)
-        cells = [f"<td><b>{label}</b></td>"]
+    def _row(label, df):
+        lk = _make_lookup(df)
+        r = [label]
         for _, col, is_amt in metrics:
             va = _val(lk, pa_key, "ALL", col)
             vb = _val(lk, pb_key, "ALL", col)
             fmt = _fa if is_amt else _fc
-            cells.append(f"<td>{fmt(va)}</td>")
-            cells.append(f"<td>{fmt(vb)}</td>")
-            cells.append(f"<td>{_fpchange(va, vb)}</td>")
-        return "<tr>" + "".join(cells) + "</tr>"
+            r += [fmt(va), fmt(vb), _pct_change(va, vb)]
+        return r
 
-    body_rows = [_row("Total", overall)]
+    rows = [_row("Total", overall)]
     for lname in sorted(lenderwise["lender"].unique()):
-        body_rows.append(
-            _row(lname, lenderwise[lenderwise["lender"] == lname])
-        )
+        rows.append(_row(lname, lenderwise[lenderwise["lender"] == lname]))
 
-    return f"<table>{header}{''.join(body_rows)}</table>"
-
-
-# ── Unique TOF ───────────────────────────────────────────────────────
-
-def _build_unique_tof_html(tof_df):
-    if tof_df.empty:
-        return "<p><em>No data</em></p>"
-    header = "<tr><th>Time Window</th><th>Unique Users</th><th>Unique Applications</th></tr>"
-    rows = []
-    for _, r in tof_df.iterrows():
-        rows.append(
-            f"<tr><td>{r['time_window']}</td>"
-            f"<td>{_fc(r['unique_users'])}</td>"
-            f"<td>{_fc(r['unique_applications'])}</td></tr>"
-        )
-    return f"<table>{header}{''.join(rows)}</table>"
-
-
-# ── Main assembler ───────────────────────────────────────────────────
-
-def _build_full_email(report_type, now, overall, lenderwise, unique_tof):
-    """
-    Assemble the full HTML email matching the shared Excel format.
-
-    Section order:
-      1. Today vs Yesterday Topline Summary
-      2. MTD vs LMTD Topline Summary (Amounts are in ₹ Cr)
-      3. Overall Summary  (interleaved funnel)
-      4. Lenderwise Summary — <Lender>  (one block per lender)
-      5. Unique User TOF Summary
-    """
-    if report_type == "hourly":
-        title = "Hourly Lending Summary - EMI BBK"
-        ts = now.strftime("%d-%b-%Y %I:%M %p")
-        summary_windows = ["today", "mtd", "lmtd"]
-        wlabels = {"today": "YTD", "mtd": "MTD", "lmtd": "LMTD"}
-        topline_cfgs = [
-            ("Today vs Yesterday Topline Summary",
-             "today", "yesterday", "TT", "YT"),
-            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr)",
-             "mtd", "lmtd", "MTD", "LMTD"),
-        ]
-    else:
-        t1_date = (now - timedelta(days=1)).strftime("%d-%b-%Y")
-        title = "Daily Lending Summary - EMI BBK"
-        ts = t1_date
-        summary_windows = ["t_minus_1", "mtd", "lmtd"]
-        wlabels = {"t_minus_1": "T-1", "mtd": "MTD", "lmtd": "LMTD"}
-        topline_cfgs = [
-            (f"T-1 ({t1_date}) vs T-2 Topline Summary",
-             "t_minus_1", "t_minus_2", "T-1", "T-2"),
-            ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr)",
-             "mtd", "lmtd", "MTD", "LMTD"),
-        ]
-
-    utypes = [("ALL", "Overall"), ("OLD", "Repeat"), ("NEW", "New")]
-
-    parts = [_EMAIL_CSS, '<div class="wrap">',
-             f"<h2>{title}</h2>", f'<div class="sub">{ts}</div>']
-
-    # ── 1 & 2. Topline tables ────────────────────────────────────────
-    for tl_title, pa, pb, pa_lbl, pb_lbl in topline_cfgs:
-        parts.append(f'<h3 class="tl">{tl_title}</h3>')
-        parts.append(_build_topline_html(lenderwise, overall, pa, pb, pa_lbl, pb_lbl))
-
-    # ── 3. Overall Summary ───────────────────────────────────────────
-    parts.append(
-        '<h3>Overall Summary: '
-        '[** All Particulars are taken as per user instances- '
-        'multiple journeys from same user is expected]</h3>'
-    )
-    parts.append(_build_funnel_html(overall, summary_windows, wlabels, utypes))
-
-    # ── 4. Lenderwise Summaries ──────────────────────────────────────
-    for lname in sorted(lenderwise["lender"].unique()):
-        ldf = lenderwise[lenderwise["lender"] == lname]
-        parts.append(f'<h3>Lenderwise Summary - {lname}:</h3>')
-        parts.append(_build_funnel_html(ldf, summary_windows, wlabels, utypes))
-
-    # ── 5. Unique User TOF ──────────────────────────────────────────
-    parts.append('<h3 class="tof">Unique User TOF Summary</h3>')
-    parts.append(_build_unique_tof_html(unique_tof))
-
-    parts.append("</div>")
-    return f"<html><head></head><body>{''.join(parts)}</body></html>"
+    return pd.DataFrame(rows, columns=col_names)
 
 
 ###########################################################################
