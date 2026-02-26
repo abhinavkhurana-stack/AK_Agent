@@ -770,11 +770,17 @@ def _do_send_closed_daily():
 ###########################################################################
 
 def test_daily_open_mail(**ctx):
-    log.info("TEST — forcing daily open mailer")
+    log.info("TEST — building open summaries + sending")
+    create_open_lenderwise()
+    create_open_overall()
+    create_unique_tof()
     _do_send_daily_open()
 
 def test_closed_daily_mail(**ctx):
-    log.info("TEST — forcing daily closed mailer")
+    log.info("TEST — building closed summaries + sending")
+    create_closed_lenderwise()
+    create_closed_overall()
+    create_unique_tof()
     _do_send_closed_daily()
 
 
