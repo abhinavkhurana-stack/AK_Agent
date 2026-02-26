@@ -32,11 +32,13 @@
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import calendar
 import logging
 import pymysql
 import sqlalchemy as sa
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 log = logging.getLogger(__name__)
 
@@ -86,10 +88,10 @@ def run_sql(statements):
 ###########################################################################
 
 def _fmt(dt):
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 def compute_windows():
-    now       = datetime.now()
+    now       = datetime.now(IST)
     today_00  = now.replace(hour=0, minute=0, second=0, microsecond=0)
     yest_00   = today_00 - timedelta(days=1)
     yest_now  = now - timedelta(days=1)
@@ -672,7 +674,7 @@ def _build_body(overall, lenderwise, unique_tof, windows, wlabels, utypes,
 def send_hourly_mail(**ctx):
     engine = get_engine()
     import pandas as pd
-    now = datetime.now()
+    now = datetime.now(IST)
 
     overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
@@ -699,7 +701,7 @@ def send_hourly_mail(**ctx):
 ###########################################################################
 
 def send_daily_open_mail(**ctx):
-    now = datetime.now()
+    now = datetime.now(IST)
     #if now.hour != DAILY_MAIL_HOUR_IST:
     #    log.info("Skipping daily open mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
     #    return
@@ -708,7 +710,7 @@ def send_daily_open_mail(**ctx):
 def _do_send_daily_open():
     engine = get_engine()
     import pandas as pd
-    now = datetime.now()
+    now = datetime.now(IST)
 
     overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_overall", engine)
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
@@ -736,7 +738,7 @@ def _do_send_daily_open():
 ###########################################################################
 
 def send_closed_daily_mail(**ctx):
-    now = datetime.now()
+    now = datetime.now(IST)
     #if now.hour != DAILY_MAIL_HOUR_IST:
     #    log.info("Skipping daily closed mailer (hour %s != %s)", now.hour, DAILY_MAIL_HOUR_IST)
     #    return
@@ -745,7 +747,7 @@ def send_closed_daily_mail(**ctx):
 def _do_send_closed_daily():
     engine = get_engine()
     import pandas as pd
-    now = datetime.now()
+    now = datetime.now(IST)
 
     overall    = pd.read_sql(f"SELECT * FROM {SCHEMA}.lrc_overall", engine)
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lrc_lenderwise", engine)
