@@ -292,7 +292,15 @@ def create_nach(**ctx):
             SELECT DISTINCT nr.mbkloanid, nr.nachSubmissionDate AS step_dt
             FROM lending.NachRegistration nr
             INNER JOIN {SCHEMA}.lr_base b ON nr.mbkloanid=b.mbkloanid
-            WHERE nr.nachSubmissionDate IS NOT NULL""",
+            WHERE nr.nachSubmissionDate IS NOT NULL
+              AND (
+                  (nr.nachtype != 'UPI_AUTOPAY'
+                   AND nr.status IN ('eMandateSuccess','pNachSuccess'))
+                  OR
+                  (nr.nachtype = 'UPI_AUTOPAY'
+                   AND nr.status = 'eMandateSuccess'
+                   AND nr.registrationstatus = 'register_success')
+              )""",
         f"ALTER TABLE {SCHEMA}.lr_nach ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(step_dt)",
     ])
 
@@ -314,12 +322,12 @@ def create_drawdown(**ctx):
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_drawdown",
         f"""CREATE TABLE {SCHEMA}.lr_drawdown AS
-            SELECT d.mbkloanid, d.drawamount AS amount,
-                d.drawdowndate AS step_dt
+            SELECT d.mbkloanid, d.lendingpartnerid AS lender_id,
+                d.drawamount AS amount, d.drawdowndate AS step_dt
             FROM lending.drawdown d
             INNER JOIN {SCHEMA}.lr_base b ON d.mbkloanid=b.mbkloanid
             WHERE d.drawdownstatus IN (4,17)""",
-        f"ALTER TABLE {SCHEMA}.lr_drawdown ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(step_dt)",
+        f"ALTER TABLE {SCHEMA}.lr_drawdown ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_lid(lender_id), ADD INDEX idx_dt(step_dt)",
     ])
 
 
@@ -384,6 +392,80 @@ _OPEN_SELECT = f"""
                WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') n ON n.mbkloanid=b.mbkloanid
     LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_sanction
                WHERE lender_id={{lid}} AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               GROUP BY mbkloanid) s ON s.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_drawdown
+               WHERE lender_id={{lid}} AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               GROUP BY mbkloanid) d ON d.mbkloanid=b.mbkloanid
+
+    WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
+    GROUP BY b.user_type WITH ROLLUP
+"""
+
+
+###########################################################################
+#  STEP 12o — OVERALL OPEN FUNNEL  (no per-lender filter on journey)
+###########################################################################
+#  The overall query does NOT filter journey by lender (no FIND_IN_SET).
+#  Lender filtering enters at lender_details via IN (all configured IDs).
+#  This avoids double-counting users eligible for multiple lenders.
+#
+
+_ALL_LIDS = ",".join(str(lid) for lid, _, _ in LENDER_ROWS)
+
+_OVERALL_OPEN_SELECT = f"""
+    SELECT
+        '{{wname}}'  AS time_window,
+        'Overall'    AS lender,
+        COALESCE(b.user_type, 'ALL') AS user_type,
+
+        COUNT(DISTINCT b.mbkloanid)                                       AS basic_details,
+        COUNT(DISTINCT a.mbkloanid)                                       AS address,
+        COUNT(DISTINCT CASE WHEN j.lpa_run=1     THEN j.mbkloanid END)   AS lpa_run,
+        COUNT(DISTINCT CASE WHEN j.lpa_pass=1    THEN j.mbkloanid END)   AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN j.pre_bre=1     THEN j.mbkloanid END)   AS pre_bre,
+        COUNT(DISTINCT CASE WHEN j.bureau_pull=1 THEN j.mbkloanid END)   AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN j.bre_success=1 THEN j.mbkloanid END)   AS bre_success,
+        COUNT(DISTINCT CASE WHEN j.post_bre=1    THEN j.mbkloanid END)   AS post_bre,
+        COUNT(DISTINCT CASE WHEN j.pan_kyc=1     THEN j.mbkloanid END)   AS pan_kyc,
+        COUNT(DISTINCT ld.mbkloanid)                                      AS lender_details,
+        COUNT(DISTINCT k.mbkloanid)                                       AS kyc,
+        COUNT(DISTINCT o.mbkloanid)                                       AS offer,
+        COUNT(DISTINCT oa.mbkloanid)                                      AS offer_accepted,
+        COUNT(DISTINCT bk.mbkloanid)                                      AS bank,
+        COUNT(DISTINCT n.mbkloanid)                                       AS nach,
+        COUNT(DISTINCT s.mbkloanid)                                       AS sanction,
+        ROUND(COALESCE(SUM(s.amount),0)/{_A},2)                          AS sanction_amt_cr,
+        COUNT(DISTINCT d.mbkloanid)                                       AS drawdown,
+        ROUND(COALESCE(SUM(d.amount),0)/{_A},2)                          AS drawdown_amt_cr
+
+    FROM {_S}.lr_base b
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_address
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') a ON a.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,
+                  MAX(stage='PreLenderSanityChecks')   AS lpa_run,
+                  MAX(stage='PostLenderSanityChecks')  AS lpa_pass,
+                  MAX(stage='PreBreFraudRulesSuccess') AS pre_bre,
+                  MAX(stage='BureauPullSuccess')       AS bureau_pull,
+                  MAX(stage='BreSuccess')              AS bre_success,
+                  MAX(stage='PostBreFraudRuleSuccess') AS post_bre,
+                  MAX(stage='PanKycValidationDone')    AS pan_kyc
+               FROM {_S}.lr_journey
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               GROUP BY mbkloanid) j ON j.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_lender_det
+               WHERE lender_id IN ({_ALL_LIDS}) AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') ld ON ld.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_kyc
+               WHERE lender_id IN ({_ALL_LIDS}) AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') k ON k.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') o ON o.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer_accept
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') oa ON oa.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_bank
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') bk ON bk.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_nach
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') n ON n.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_sanction
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
                GROUP BY mbkloanid) s ON s.mbkloanid=b.mbkloanid
     LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_drawdown
                WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
@@ -461,7 +543,7 @@ _CLOSED_SELECT_NAC = f"""
                WHERE lender_id={{lid}} AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
                GROUP BY mbkloanid) s ON s.mbkloanid=n.mbkloanid               -- sanction ← nach
     LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_drawdown
-               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               WHERE lender_id={{lid}} AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
                GROUP BY mbkloanid) d ON d.mbkloanid=s.mbkloanid               -- drawdown ← sanction
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
     GROUP BY b.user_type WITH ROLLUP
@@ -521,8 +603,65 @@ _CLOSED_SELECT_DEFAULT = f"""
                WHERE lender_id={{lid}} AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
                GROUP BY mbkloanid) s ON s.mbkloanid=n.mbkloanid               -- sanction ← nach
     LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_drawdown
-               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               WHERE lender_id={{lid}} AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
                GROUP BY mbkloanid) d ON d.mbkloanid=s.mbkloanid               -- drawdown ← sanction
+    WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
+    GROUP BY b.user_type WITH ROLLUP
+"""
+
+###########################################################################
+#  OVERALL CLOSED FUNNEL  (no per-lender filter, chains from previous step)
+###########################################################################
+
+_OVERALL_CLOSED_SELECT = f"""
+    SELECT
+        '{{wname}}'  AS time_window,
+        'Overall'    AS lender,
+        COALESCE(b.user_type, 'ALL') AS user_type,
+        COUNT(DISTINCT b.mbkloanid) AS basic_details, COUNT(DISTINCT a.mbkloanid) AS address,
+        COUNT(DISTINCT CASE WHEN j.cf1=1 THEN j.mbkloanid END) AS lpa_run,
+        COUNT(DISTINCT CASE WHEN j.cf2=1 THEN j.mbkloanid END) AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN j.cf3=1 THEN j.mbkloanid END) AS pre_bre,
+        COUNT(DISTINCT CASE WHEN j.cf4=1 THEN j.mbkloanid END) AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN j.cf5=1 THEN j.mbkloanid END) AS bre_success,
+        COUNT(DISTINCT CASE WHEN j.cf6=1 THEN j.mbkloanid END) AS post_bre,
+        COUNT(DISTINCT CASE WHEN j.cf7=1 THEN j.mbkloanid END) AS pan_kyc,
+        COUNT(DISTINCT ld.mbkloanid) AS lender_details, COUNT(DISTINCT k.mbkloanid) AS kyc,
+        COUNT(DISTINCT o.mbkloanid) AS offer, COUNT(DISTINCT oa.mbkloanid) AS offer_accepted,
+        COUNT(DISTINCT bk.mbkloanid) AS bank, COUNT(DISTINCT n.mbkloanid) AS nach,
+        COUNT(DISTINCT s.mbkloanid) AS sanction, ROUND(COALESCE(SUM(s.amount),0)/{_A},2) AS sanction_amt_cr,
+        COUNT(DISTINCT d.mbkloanid) AS drawdown, ROUND(COALESCE(SUM(d.amount),0)/{_A},2) AS drawdown_amt_cr
+    FROM {_S}.lr_base b
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_address
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') a ON a.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,
+                  MAX(stage='PreLenderSanityChecks') AS cf1,
+                  MAX(stage='PreLenderSanityChecks')*MAX(stage='PostLenderSanityChecks') AS cf2,
+                  MAX(stage='PreLenderSanityChecks')*MAX(stage='PostLenderSanityChecks')*MAX(stage='PreBreFraudRulesSuccess') AS cf3,
+                  MAX(stage='PreLenderSanityChecks')*MAX(stage='PostLenderSanityChecks')*MAX(stage='PreBreFraudRulesSuccess')*MAX(stage='BureauPullSuccess') AS cf4,
+                  MAX(stage='PreLenderSanityChecks')*MAX(stage='PostLenderSanityChecks')*MAX(stage='PreBreFraudRulesSuccess')*MAX(stage='BureauPullSuccess')*MAX(stage='BreSuccess') AS cf5,
+                  MAX(stage='PreLenderSanityChecks')*MAX(stage='PostLenderSanityChecks')*MAX(stage='PreBreFraudRulesSuccess')*MAX(stage='BureauPullSuccess')*MAX(stage='BreSuccess')*MAX(stage='PostBreFraudRuleSuccess') AS cf6,
+                  MAX(stage='PreLenderSanityChecks')*MAX(stage='PostLenderSanityChecks')*MAX(stage='PreBreFraudRulesSuccess')*MAX(stage='BureauPullSuccess')*MAX(stage='BreSuccess')*MAX(stage='PostBreFraudRuleSuccess')*MAX(stage='PanKycValidationDone') AS cf7
+               FROM {_S}.lr_journey
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               GROUP BY mbkloanid) j ON j.mbkloanid=a.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_lender_det
+               WHERE lender_id IN ({_ALL_LIDS}) AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') ld
+        ON ld.mbkloanid=j.mbkloanid AND j.cf7=1
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') o ON o.mbkloanid=ld.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer_accept
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') oa ON oa.mbkloanid=o.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_bank
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') bk ON bk.mbkloanid=oa.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_nach
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') n ON n.mbkloanid=bk.mbkloanid
+    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_sanction
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               GROUP BY mbkloanid) s ON s.mbkloanid=n.mbkloanid
+    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_drawdown
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}'
+               GROUP BY mbkloanid) d ON d.mbkloanid=s.mbkloanid
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
     GROUP BY b.user_type WITH ROLLUP
 """
@@ -565,19 +704,17 @@ def _create_summary(table_name, select_template):
             stmts.append(f"INSERT INTO {SCHEMA}.{table_name} {sql}")
     run_sql(stmts)
 
-def _create_overall(src_table, dst_table):
-    cols = ("basic_details,address,lpa_run,lpa_pass,pre_bre,bureau_pull,"
-            "bre_success,post_bre,pan_kyc,lender_details,kyc,"
-            "offer,offer_accepted,bank,nach,"
-            "sanction,sanction_amt_cr,drawdown,drawdown_amt_cr")
-    sums = ",".join(f"SUM({c}) AS {c}" for c in cols.split(","))
-    run_sql([
-        f"DROP TABLE IF EXISTS {SCHEMA}.{dst_table}",
-        f"""CREATE TABLE {SCHEMA}.{dst_table} AS
-            SELECT time_window, user_type, {sums}
-            FROM {SCHEMA}.{src_table} GROUP BY time_window, user_type""",
-        f"ALTER TABLE {SCHEMA}.{dst_table} ADD INDEX idx_tw(time_window), ADD INDEX idx_ut(user_type)",
-    ])
+def _create_overall_direct(table_name, overall_template):
+    """Create overall table using a direct query (not SUM of lenderwise)."""
+    windows, _, _, _ = compute_windows()
+    stmts = [
+        f"DROP TABLE IF EXISTS {SCHEMA}.{table_name}",
+        f"CREATE TABLE {SCHEMA}.{table_name} {_SUMMARY_COLS}",
+    ]
+    for wname, (wstart, wend) in windows.items():
+        sql = overall_template.format(wname=wname, wstart=wstart, wend=wend)
+        stmts.append(f"INSERT INTO {SCHEMA}.{table_name} {sql}")
+    run_sql(stmts)
 
 
 ###########################################################################
@@ -588,7 +725,7 @@ def create_open_lenderwise(**ctx):
     _create_summary("lr_lenderwise", _OPEN_SELECT)
 
 def create_open_overall(**ctx):
-    _create_overall("lr_lenderwise", "lr_overall")
+    _create_overall_direct("lr_overall", _OVERALL_OPEN_SELECT)
 
 
 ###########################################################################
@@ -602,7 +739,7 @@ def create_closed_lenderwise(**ctx):
     })
 
 def create_closed_overall(**ctx):
-    _create_overall("lrc_lenderwise", "lrc_overall")
+    _create_overall_direct("lrc_overall", _OVERALL_CLOSED_SELECT)
 
 
 ###########################################################################
