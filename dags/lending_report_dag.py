@@ -23,10 +23,8 @@
 
   TESTING
   ───────
-  To force-fire the daily emails outside of 9 AM IST, call:
-      test_daily_open_mail()
-      test_closed_daily_mail()
-  Or trigger the test_* Airflow tasks (wired at the bottom of the DAG).
+  To force-fire daily emails, comment out the hour-check lines in
+  send_daily_open_mail() / send_closed_daily_mail() and trigger the DAG.
 ===============================================================================
 """
 
@@ -875,61 +873,6 @@ def _do_send_closed_daily():
     send_email(to=EMAIL_TO, subject=subj, html_content=body)
 
 
-###########################################################################
-#  FULL PIPELINE  (used by test tasks to run everything end-to-end)
-###########################################################################
-
-def _run_full_pipeline():
-    """Run every step from scratch: lenders → repeat_logic → base → steps → summaries."""
-    log.info("PIPELINE — creating lender ref + repeat logic tables")
-    create_lenders()
-    create_repeat_logic()
-
-    log.info("PIPELINE — creating base table")
-    create_base()
-
-    log.info("PIPELINE — creating step tables")
-    create_address()
-    create_journey()
-    create_lender_det()
-    create_offer()
-    create_offer_accept()
-    create_kyc()
-    create_bank()
-    create_nach()
-    create_sanction()
-    create_drawdown()
-
-    log.info("PIPELINE — creating open funnel summaries")
-    create_open_lenderwise()
-    create_open_overall()
-
-    log.info("PIPELINE — creating closed funnel summaries")
-    create_closed_lenderwise()
-    create_closed_overall()
-
-    log.info("PIPELINE — creating unique TOF")
-    create_unique_tof()
-
-    log.info("PIPELINE — done")
-
-
-###########################################################################
-#  TEST TASKS — trigger these to force-fire daily emails right now
-#
-#  These run the FULL pipeline (base → steps → summaries) then send.
-#  Safe to trigger standalone — no upstream dependency needed.
-###########################################################################
-
-def test_daily_open_mail(**ctx):
-    log.info("TEST — full pipeline + daily open email")
-    _run_full_pipeline()
-    _do_send_daily_open()
-
-def test_closed_daily_mail(**ctx):
-    log.info("TEST — full pipeline + daily closed email")
-    _run_full_pipeline()
-    _do_send_closed_daily()
 
 
 ###########################################################################
@@ -976,9 +919,6 @@ t17 = PythonOperator(task_id="send_hourly_open",     python_callable=send_hourly
 t18 = PythonOperator(task_id="send_daily_open",      python_callable=send_daily_open_mail,     dag=dag)
 t19 = PythonOperator(task_id="send_daily_closed",    python_callable=send_closed_daily_mail,   dag=dag)
 
-# ── Test tasks (trigger manually to force-fire daily emails) ─────────
-t20 = PythonOperator(task_id="test_daily_open",      python_callable=test_daily_open_mail,     dag=dag)
-t21 = PythonOperator(task_id="test_daily_closed",    python_callable=test_closed_daily_mail,   dag=dag)
 
 # ── Wiring ───────────────────────────────────────────────────────────
 #
