@@ -336,6 +336,8 @@ _OPEN_SELECT = """
         COUNT(DISTINCT CASE WHEN j.bre_success=1 THEN j.mbkloanid END)   AS bre_success,
         COUNT(DISTINCT CASE WHEN j.post_bre=1    THEN j.mbkloanid END)   AS post_bre,
         COUNT(DISTINCT CASE WHEN j.pan_kyc=1     THEN j.mbkloanid END)   AS pan_kyc,
+        COUNT(DISTINCT ld.mbkloanid)                                      AS lender_details,
+        COUNT(DISTINCT k.mbkloanid)                                       AS kyc,
         COUNT(DISTINCT o.mbkloanid)                                       AS offer,
         COUNT(DISTINCT oa.mbkloanid)                                      AS offer_accepted,
         COUNT(DISTINCT bk.mbkloanid)                                      AS bank,
@@ -350,6 +352,8 @@ _OPEN_SELECT = """
     LEFT JOIN (SELECT mbkloanid,lpa_run,lpa_pass,pre_bre,bureau_pull,
                       bre_success,post_bre,pan_kyc
                FROM {sch}.lr_journey WHERE lender_id={{lid}}) j ON j.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_lender_det WHERE lender_id={{lid}}) ld ON ld.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_kyc WHERE lender_id={{lid}}) k ON k.mbkloanid=b.mbkloanid
     LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer WHERE lender_id={{lid}}) o ON o.mbkloanid=b.mbkloanid
     LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer_accept WHERE lender_id={{lid}}) oa ON oa.mbkloanid=b.mbkloanid
     LEFT JOIN {sch}.lr_bank bk ON bk.mbkloanid=b.mbkloanid
@@ -366,76 +370,104 @@ _OPEN_SELECT = """
 #  STEP 12c — CLOSED FUNNEL LENDERWISE SUMMARY
 ###########################################################################
 #
-#  Same JOINs, but each step's COUNT requires ALL prior steps to be present.
-#  Journey flags are multiplied cumulatively (1*1*1=1, 1*0*1=0) so
-#  cf_pan_kyc=1 means every journey stage passed.
+#  Each step chains from the PREVIOUS step.
+#  Journey flags multiplied cumulatively: cf7=1 → all 7 stages passed.
+#
+#  KYC position differs per lender:
+#    NAC:    … → pan_kyc → LAD → KYC → offer → offer_accept → bank → …
+#    Others: … → pan_kyc → LAD → offer → offer_accept → KYC → bank → …
 #
 
-_CLOSED_SELECT = """
+_S = SCHEMA
+_A = int(AMOUNT_DIVISOR)
+
+# NAC closed chain: … → journey → LAD → KYC → offer → offer_accept → bank → …
+_CLOSED_SELECT_NAC = f"""
     SELECT
-        '{{wname}}'  AS time_window,
-        '{{lname}}'  AS lender,
-        COALESCE(b.user_type, 'ALL') AS user_type,
-
-        COUNT(DISTINCT b.mbkloanid)                                       AS basic_details,
-        COUNT(DISTINCT a.mbkloanid)                                       AS address,
-        COUNT(DISTINCT CASE WHEN j.cf1=1 THEN j.mbkloanid END)           AS lpa_run,
-        COUNT(DISTINCT CASE WHEN j.cf2=1 THEN j.mbkloanid END)           AS lpa_pass,
-        COUNT(DISTINCT CASE WHEN j.cf3=1 THEN j.mbkloanid END)           AS pre_bre,
-        COUNT(DISTINCT CASE WHEN j.cf4=1 THEN j.mbkloanid END)           AS bureau_pull,
-        COUNT(DISTINCT CASE WHEN j.cf5=1 THEN j.mbkloanid END)           AS bre_success,
-        COUNT(DISTINCT CASE WHEN j.cf6=1 THEN j.mbkloanid END)           AS post_bre,
-        COUNT(DISTINCT CASE WHEN j.cf7=1 THEN j.mbkloanid END)           AS pan_kyc,
-        COUNT(DISTINCT o.mbkloanid)                                       AS offer,
-        COUNT(DISTINCT oa.mbkloanid)                                      AS offer_accepted,
-        COUNT(DISTINCT bk.mbkloanid)                                      AS bank,
-        COUNT(DISTINCT n.mbkloanid)                                       AS nach,
-        COUNT(DISTINCT s.mbkloanid)                                       AS sanction,
-        ROUND(COALESCE(SUM(s.amount),0)/{amt_div},2)                     AS sanction_amt_cr,
-        COUNT(DISTINCT d.mbkloanid)                                       AS drawdown,
-        ROUND(COALESCE(SUM(d.amount),0)/{amt_div},2)                     AS drawdown_amt_cr
-
-    FROM {sch}.lr_base b
-
-    LEFT JOIN {sch}.lr_address a
-        ON a.mbkloanid = b.mbkloanid                                      -- address ← base
-
-    LEFT JOIN (
-        SELECT mbkloanid,
-            lpa_run                                                          AS cf1,
-            lpa_run*lpa_pass                                                 AS cf2,
-            lpa_run*lpa_pass*pre_bre                                         AS cf3,
-            lpa_run*lpa_pass*pre_bre*bureau_pull                             AS cf4,
-            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success                 AS cf5,
-            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre        AS cf6,
+        '{{wname}}' AS time_window, '{{lname}}' AS lender,
+        COALESCE(b.user_type,'ALL') AS user_type,
+        COUNT(DISTINCT b.mbkloanid) AS basic_details, COUNT(DISTINCT a.mbkloanid) AS address,
+        COUNT(DISTINCT CASE WHEN j.cf1=1 THEN j.mbkloanid END) AS lpa_run,
+        COUNT(DISTINCT CASE WHEN j.cf2=1 THEN j.mbkloanid END) AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN j.cf3=1 THEN j.mbkloanid END) AS pre_bre,
+        COUNT(DISTINCT CASE WHEN j.cf4=1 THEN j.mbkloanid END) AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN j.cf5=1 THEN j.mbkloanid END) AS bre_success,
+        COUNT(DISTINCT CASE WHEN j.cf6=1 THEN j.mbkloanid END) AS post_bre,
+        COUNT(DISTINCT CASE WHEN j.cf7=1 THEN j.mbkloanid END) AS pan_kyc,
+        COUNT(DISTINCT ld.mbkloanid) AS lender_details, COUNT(DISTINCT k.mbkloanid) AS kyc,
+        COUNT(DISTINCT o.mbkloanid) AS offer, COUNT(DISTINCT oa.mbkloanid) AS offer_accepted,
+        COUNT(DISTINCT bk.mbkloanid) AS bank, COUNT(DISTINCT n.mbkloanid) AS nach,
+        COUNT(DISTINCT s.mbkloanid) AS sanction, ROUND(COALESCE(SUM(s.amount),0)/{_A},2) AS sanction_amt_cr,
+        COUNT(DISTINCT d.mbkloanid) AS drawdown, ROUND(COALESCE(SUM(d.amount),0)/{_A},2) AS drawdown_amt_cr
+    FROM {_S}.lr_base b
+    LEFT JOIN {_S}.lr_address a ON a.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,
+            lpa_run AS cf1, lpa_run*lpa_pass AS cf2, lpa_run*lpa_pass*pre_bre AS cf3,
+            lpa_run*lpa_pass*pre_bre*bureau_pull AS cf4,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success AS cf5,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre AS cf6,
             lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre*pan_kyc AS cf7
-        FROM {sch}.lr_journey WHERE lender_id={{lid}}
-    ) j ON j.mbkloanid = a.mbkloanid                                      -- journey ← address
-
-    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer
-               WHERE lender_id={{lid}}) o
-        ON o.mbkloanid = j.mbkloanid AND j.cf7 = 1                        -- offer ← journey (all 7 stages)
-
-    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer_accept
-               WHERE lender_id={{lid}}) oa
-        ON oa.mbkloanid = o.mbkloanid                                      -- offer_accept ← offer
-
-    LEFT JOIN {sch}.lr_bank bk
-        ON bk.mbkloanid = oa.mbkloanid                                    -- bank ← offer_accept
-
-    LEFT JOIN {sch}.lr_nach n
-        ON n.mbkloanid = bk.mbkloanid                                     -- nach ← bank
-
-    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {sch}.lr_sanction
-               WHERE lender_id={{lid}} GROUP BY mbkloanid) s
-        ON s.mbkloanid = n.mbkloanid                                       -- sanction ← nach
-
-    LEFT JOIN {sch}.lr_drawdown d
-        ON d.mbkloanid = s.mbkloanid                                       -- drawdown ← sanction
-
+        FROM {_S}.lr_journey WHERE lender_id={{lid}}) j ON j.mbkloanid=a.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_lender_det WHERE lender_id={{lid}}) ld
+        ON ld.mbkloanid=j.mbkloanid AND j.cf7=1                                -- LAD ← journey
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_kyc WHERE lender_id={{lid}}) k
+        ON k.mbkloanid=ld.mbkloanid                                            -- KYC ← LAD  (NAC)
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer WHERE lender_id={{lid}}) o
+        ON o.mbkloanid=k.mbkloanid                                             -- offer ← KYC
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer_accept WHERE lender_id={{lid}}) oa
+        ON oa.mbkloanid=o.mbkloanid                                            -- offer_accept ← offer
+    LEFT JOIN {_S}.lr_bank bk ON bk.mbkloanid=oa.mbkloanid                     -- bank ← offer_accept
+    LEFT JOIN {_S}.lr_nach n  ON n.mbkloanid=bk.mbkloanid                      -- nach ← bank
+    LEFT JOIN (SELECT mbkloanid,SUM(amount) AS amount FROM {_S}.lr_sanction WHERE lender_id={{lid}} GROUP BY mbkloanid) s
+        ON s.mbkloanid=n.mbkloanid                                             -- sanction ← nach
+    LEFT JOIN {_S}.lr_drawdown d ON d.mbkloanid=s.mbkloanid                    -- drawdown ← sanction
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
     GROUP BY b.user_type WITH ROLLUP
-""".format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
+"""
+
+# Default closed chain: … → journey → LAD → offer → offer_accept → KYC → bank → …
+_CLOSED_SELECT_DEFAULT = f"""
+    SELECT
+        '{{wname}}' AS time_window, '{{lname}}' AS lender,
+        COALESCE(b.user_type,'ALL') AS user_type,
+        COUNT(DISTINCT b.mbkloanid) AS basic_details, COUNT(DISTINCT a.mbkloanid) AS address,
+        COUNT(DISTINCT CASE WHEN j.cf1=1 THEN j.mbkloanid END) AS lpa_run,
+        COUNT(DISTINCT CASE WHEN j.cf2=1 THEN j.mbkloanid END) AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN j.cf3=1 THEN j.mbkloanid END) AS pre_bre,
+        COUNT(DISTINCT CASE WHEN j.cf4=1 THEN j.mbkloanid END) AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN j.cf5=1 THEN j.mbkloanid END) AS bre_success,
+        COUNT(DISTINCT CASE WHEN j.cf6=1 THEN j.mbkloanid END) AS post_bre,
+        COUNT(DISTINCT CASE WHEN j.cf7=1 THEN j.mbkloanid END) AS pan_kyc,
+        COUNT(DISTINCT ld.mbkloanid) AS lender_details, COUNT(DISTINCT k.mbkloanid) AS kyc,
+        COUNT(DISTINCT o.mbkloanid) AS offer, COUNT(DISTINCT oa.mbkloanid) AS offer_accepted,
+        COUNT(DISTINCT bk.mbkloanid) AS bank, COUNT(DISTINCT n.mbkloanid) AS nach,
+        COUNT(DISTINCT s.mbkloanid) AS sanction, ROUND(COALESCE(SUM(s.amount),0)/{_A},2) AS sanction_amt_cr,
+        COUNT(DISTINCT d.mbkloanid) AS drawdown, ROUND(COALESCE(SUM(d.amount),0)/{_A},2) AS drawdown_amt_cr
+    FROM {_S}.lr_base b
+    LEFT JOIN {_S}.lr_address a ON a.mbkloanid=b.mbkloanid
+    LEFT JOIN (SELECT mbkloanid,
+            lpa_run AS cf1, lpa_run*lpa_pass AS cf2, lpa_run*lpa_pass*pre_bre AS cf3,
+            lpa_run*lpa_pass*pre_bre*bureau_pull AS cf4,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success AS cf5,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre AS cf6,
+            lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre*pan_kyc AS cf7
+        FROM {_S}.lr_journey WHERE lender_id={{lid}}) j ON j.mbkloanid=a.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_lender_det WHERE lender_id={{lid}}) ld
+        ON ld.mbkloanid=j.mbkloanid AND j.cf7=1                                -- LAD ← journey
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer WHERE lender_id={{lid}}) o
+        ON o.mbkloanid=ld.mbkloanid                                            -- offer ← LAD
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer_accept WHERE lender_id={{lid}}) oa
+        ON oa.mbkloanid=o.mbkloanid                                            -- offer_accept ← offer
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_kyc WHERE lender_id={{lid}}) k
+        ON k.mbkloanid=oa.mbkloanid                                            -- KYC ← offer_accept  (default)
+    LEFT JOIN {_S}.lr_bank bk ON bk.mbkloanid=k.mbkloanid                      -- bank ← KYC
+    LEFT JOIN {_S}.lr_nach n  ON n.mbkloanid=bk.mbkloanid                      -- nach ← bank
+    LEFT JOIN (SELECT mbkloanid,SUM(amount) AS amount FROM {_S}.lr_sanction WHERE lender_id={{lid}} GROUP BY mbkloanid) s
+        ON s.mbkloanid=n.mbkloanid                                             -- sanction ← nach
+    LEFT JOIN {_S}.lr_drawdown d ON d.mbkloanid=s.mbkloanid                    -- drawdown ← sanction
+    WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
+    GROUP BY b.user_type WITH ROLLUP
+"""
 
 
 ###########################################################################
@@ -448,7 +480,8 @@ _SUMMARY_COLS = """(
     lpa_run BIGINT DEFAULT 0, lpa_pass BIGINT DEFAULT 0,
     pre_bre BIGINT DEFAULT 0, bureau_pull BIGINT DEFAULT 0,
     bre_success BIGINT DEFAULT 0, post_bre BIGINT DEFAULT 0,
-    pan_kyc BIGINT DEFAULT 0,
+    pan_kyc BIGINT DEFAULT 0, lender_details BIGINT DEFAULT 0,
+    kyc BIGINT DEFAULT 0,
     offer BIGINT DEFAULT 0, offer_accepted BIGINT DEFAULT 0,
     bank BIGINT DEFAULT 0, nach BIGINT DEFAULT 0,
     sanction BIGINT DEFAULT 0, sanction_amt_cr DECIMAL(14,2) DEFAULT 0,
@@ -457,21 +490,27 @@ _SUMMARY_COLS = """(
 )"""
 
 def _create_summary(table_name, select_template):
+    """select_template: a string (same for all lenders) or a dict {lender_name: template, '_default': template}."""
     windows, _, _, _ = compute_windows()
     stmts = [
         f"DROP TABLE IF EXISTS {SCHEMA}.{table_name}",
         f"CREATE TABLE {SCHEMA}.{table_name} {_SUMMARY_COLS}",
     ]
     for lid, lname, _ in LENDER_ROWS:
+        if isinstance(select_template, dict):
+            tpl = select_template.get(lname, select_template["_default"])
+        else:
+            tpl = select_template
         for wname, (wstart, wend) in windows.items():
-            sql = select_template.format(wname=wname, lname=lname, lid=lid,
-                                         wstart=wstart, wend=wend)
+            sql = tpl.format(wname=wname, lname=lname, lid=lid,
+                             wstart=wstart, wend=wend)
             stmts.append(f"INSERT INTO {SCHEMA}.{table_name} {sql}")
     run_sql(stmts)
 
 def _create_overall(src_table, dst_table):
     cols = ("basic_details,address,lpa_run,lpa_pass,pre_bre,bureau_pull,"
-            "bre_success,post_bre,pan_kyc,offer,offer_accepted,bank,nach,"
+            "bre_success,post_bre,pan_kyc,lender_details,kyc,"
+            "offer,offer_accepted,bank,nach,"
             "sanction,sanction_amt_cr,drawdown,drawdown_amt_cr")
     sums = ",".join(f"SUM({c}) AS {c}" for c in cols.split(","))
     run_sql([
@@ -499,7 +538,10 @@ def create_open_overall(**ctx):
 ###########################################################################
 
 def create_closed_lenderwise(**ctx):
-    _create_summary("lrc_lenderwise", _CLOSED_SELECT)
+    _create_summary("lrc_lenderwise", {
+        "NAC": _CLOSED_SELECT_NAC,
+        "_default": _CLOSED_SELECT_DEFAULT,
+    })
 
 def create_closed_overall(**ctx):
     _create_overall("lrc_lenderwise", "lrc_overall")
@@ -530,7 +572,8 @@ def create_unique_tof(**ctx):
 #  FUNNEL DISPLAY ROWS  (drives the email grid)
 ###########################################################################
 
-_FUNNEL_DISPLAY = [
+# Shared prefix: Basic_Details … PAN_Validation
+_FD_PREFIX = [
     ("Basic_Details",                               "basic_details",   None,             None),
     ("Address_Details",                             "address",         None,             None),
     ("% Address_details_from_Basic_Details",         None,             "address",        "basic_details"),
@@ -548,12 +591,10 @@ _FUNNEL_DISPLAY = [
     ("%Post_BRE_from_BRE_Success",                   None,             "post_bre",       "bre_success"),
     ("PAN_Validation",                              "pan_kyc",         None,             None),
     ("% PAN_Validation_from_Post_BRE",               None,             "pan_kyc",        "post_bre"),
-    ("Offer_Generated",                             "offer",           None,             None),
-    ("% Offer_Generated_from_PAN_Validation",        None,             "offer",          "pan_kyc"),
-    ("Offer_Accepted",                              "offer_accepted",  None,             None),
-    ("%Offer_accepted_from_Offer_Generated",         None,             "offer_accepted", "offer"),
-    ("Bank_Verified",                               "bank",            None,             None),
-    ("%Bank_Verified_from_Offer_Accepted",           None,             "bank",           "offer_accepted"),
+]
+
+# Shared suffix: NACH … Drawdown_Amount
+_FD_SUFFIX = [
     ("NACH",                                        "nach",            None,             None),
     ("% NACH_from_Bank_Verified",                    None,             "nach",           "bank"),
     ("Loan_Sanctioned",                             "sanction",        None,             None),
@@ -565,6 +606,40 @@ _FUNNEL_DISPLAY = [
     ("Sanctioned_Amount (in Cr.)",                  "sanction_amt_cr", None,             None),
     ("Drawdown_Amount (in Cr.)",                    "drawdown_amt_cr", None,             None),
 ]
+
+# Overall + NAC: … PAN → LAD → KYC → Offer → Offer_Accepted → Bank → …
+_FD_MIDDLE_NAC = [
+    ("Lender_Additional_Details",                   "lender_details",  None,                None),
+    ("% LAD_from_PAN_Validation",                    None,             "lender_details",    "pan_kyc"),
+    ("KYC_Done",                                    "kyc",             None,                None),
+    ("% KYC_Done_from_LAD",                          None,             "kyc",               "lender_details"),
+    ("Offer_Generated",                             "offer",           None,                None),
+    ("% Offer_Generated_from_KYC_Done",              None,             "offer",             "kyc"),
+    ("Offer_Accepted",                              "offer_accepted",  None,                None),
+    ("%Offer_accepted_from_Offer_Generated",         None,             "offer_accepted",    "offer"),
+    ("Bank_Verified",                               "bank",            None,                None),
+    ("%Bank_Verified_from_Offer_Accepted",           None,             "bank",              "offer_accepted"),
+]
+
+# PFL / SMFGPL / others: … PAN → LAD → Offer → Offer_Accepted → KYC → Bank → …
+_FD_MIDDLE_DEFAULT = [
+    ("Lender_Additional_Details",                   "lender_details",  None,                None),
+    ("% LAD_from_PAN_Validation",                    None,             "lender_details",    "pan_kyc"),
+    ("Offer_Generated",                             "offer",           None,                None),
+    ("% Offer_Generated_from_LAD",                   None,             "offer",             "lender_details"),
+    ("Offer_Accepted",                              "offer_accepted",  None,                None),
+    ("%Offer_accepted_from_Offer_Generated",         None,             "offer_accepted",    "offer"),
+    ("KYC_Done",                                    "kyc",             None,                None),
+    ("% KYC_Done_from_Offer_Accepted",               None,             "kyc",               "offer_accepted"),
+    ("Bank_Verified",                               "bank",            None,                None),
+    ("%Bank_Verified_from_KYC_Done",                 None,             "bank",              "kyc"),
+]
+
+def _get_funnel_display(lender=None):
+    """Return the funnel row definitions for a given lender (or overall)."""
+    if lender == "NAC" or lender is None:
+        return _FD_PREFIX + _FD_MIDDLE_NAC + _FD_SUFFIX
+    return _FD_PREFIX + _FD_MIDDLE_DEFAULT + _FD_SUFFIX
 
 
 ###########################################################################
@@ -626,7 +701,7 @@ def _pct_change(a, b):
         return f"{(a-b)/b*100:.2f}%"
     except (ValueError, TypeError): return ""
 
-def _make_funnel_df(summary_df, windows, wlabels, utypes):
+def _make_funnel_df(summary_df, windows, wlabels, utypes, lender=None):
     import pandas as pd
     lk = _make_lookup(summary_df)
     col_names, col_keys = ["Particular"], []
@@ -635,7 +710,7 @@ def _make_funnel_df(summary_df, windows, wlabels, utypes):
             col_names.append(f"{wlabels[wk]}_{ut_label}")
             col_keys.append((wk, ut_key))
     rows = []
-    for label, val_col, pct_num, pct_den in _FUNNEL_DISPLAY:
+    for label, val_col, pct_num, pct_den in _get_funnel_display(lender):
         row = [label]
         for wk, ut in col_keys:
             if val_col is None:
@@ -686,12 +761,12 @@ def _build_body(overall, lenderwise, unique_tof, windows, wlabels, utypes,
 
     body += ("<h3>Overall Summary: [** All Particulars are taken as per user "
              "instances- multiple journeys from same user is expected]</h3>\n")
-    body += _make_funnel_df(overall, windows, wlabels, utypes).to_html(index=False)
+    body += _make_funnel_df(overall, windows, wlabels, utypes, lender=None).to_html(index=False)
 
     for lname in sorted(lenderwise["lender"].unique()):
         ldf = lenderwise[lenderwise["lender"]==lname]
         body += f"<h3>Lenderwise Summary - {lname}:</h3>\n"
-        body += _make_funnel_df(ldf, windows, wlabels, utypes).to_html(index=False) + "\n"
+        body += _make_funnel_df(ldf, windows, wlabels, utypes, lender=lname).to_html(index=False) + "\n"
 
     body += "</body>\n</html>"
     return body
