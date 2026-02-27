@@ -652,8 +652,11 @@ _OVERALL_CLOSED_SELECT = f"""
                WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') o ON o.mbkloanid=ld.mbkloanid
     LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_offer_accept
                WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') oa ON oa.mbkloanid=o.mbkloanid
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_kyc
+               WHERE lender_id IN ({_ALL_LIDS}) AND step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') k
+        ON k.mbkloanid=oa.mbkloanid                                           -- KYC ← offer_accept
     LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_bank
-               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') bk ON bk.mbkloanid=oa.mbkloanid
+               WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') bk ON bk.mbkloanid=k.mbkloanid
     LEFT JOIN (SELECT DISTINCT mbkloanid FROM {_S}.lr_nach
                WHERE step_dt >= '{{wstart}}' AND step_dt < '{{wend}}') n ON n.mbkloanid=bk.mbkloanid
     LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {_S}.lr_sanction
