@@ -134,25 +134,59 @@ def create_lenders(**ctx):
 
 
 ###########################################################################
+#  STEP 0.5 — REPEAT LOGIC
+###########################################################################
+#
+#  A member is "Repeat" if they have a DIFFERENT prior drawdown (non-mca).
+#  This table stores each member's FIRST successful drawdown mbkloanid.
+#
+
+def create_repeat_logic(**ctx):
+    run_sql([
+        f"DROP TABLE IF EXISTS {SCHEMA}.lr_repeat_logic",
+        f"""CREATE TABLE {SCHEMA}.lr_repeat_logic AS
+            SELECT memberuid, mbkloanid AS first_dd_mbkloanid
+            FROM (
+                SELECT cl.memberuid, cl.mbkloanid,
+                    ROW_NUMBER() OVER (PARTITION BY cl.memberuid
+                                       ORDER BY cl.lineactivationdate ASC) AS rnk
+                FROM lending.creditline cl
+                INNER JOIN (
+                    SELECT DISTINCT mbkloanid FROM lending.drawdown
+                    WHERE drawdownstatus IN (4,17)
+                ) d ON cl.mbkloanid = d.mbkloanid
+                INNER JOIN lending.boost m ON cl.mbkloanid = m.mbkloanid
+                WHERE m.mca = 0
+            ) ranked
+            WHERE rnk = 1""",
+        f"ALTER TABLE {SCHEMA}.lr_repeat_logic ADD INDEX idx_muid(memberuid)",
+    ])
+
+
+###########################################################################
 #  STEP 1 — BASE
 ###########################################################################
+#
+#  user_type logic (matches the original Athena query):
+#    Repeat = member has a prior drawdown on a DIFFERENT mbkloanid (non-mca)
+#    New    = no prior drawdown, or this IS the member's first drawdown
+#
 
 def create_base(**ctx):
     w, ws, we, _ = compute_windows()
     run_sql([
         f"DROP TABLE IF EXISTS {SCHEMA}.lr_base",
         f"""CREATE TABLE {SCHEMA}.lr_base AS
-            SELECT DISTINCT b.mbkloanid, b.createdat, b.memberid, fs.first_seen
+            SELECT DISTINCT
+                b.mbkloanid, b.createdat, b.memberid,
+                CASE WHEN rl.first_dd_mbkloanid IS NOT NULL
+                          AND rl.first_dd_mbkloanid <> b.mbkloanid
+                     THEN 'Repeat' ELSE 'New' END AS user_type
             FROM lending.boost b
-            INNER JOIN (
-                SELECT memberid, MIN(createdat) AS first_seen
-                FROM lending.boost
-                WHERE kycflow='HYBRID_KYC_FLOW'
-                GROUP BY memberid
-            ) fs ON b.memberid = fs.memberid
+            LEFT JOIN {SCHEMA}.lr_repeat_logic rl ON b.memberuid = rl.memberuid
             WHERE b.kycflow='HYBRID_KYC_FLOW'
               AND b.createdat >= '{ws}' AND b.createdat < '{we}'""",
-        f"ALTER TABLE {SCHEMA}.lr_base ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(createdat), ADD INDEX idx_fs(first_seen)",
+        f"ALTER TABLE {SCHEMA}.lr_base ADD INDEX idx_mbk(mbkloanid), ADD INDEX idx_dt(createdat), ADD INDEX idx_ut(user_type)",
     ])
 
 
@@ -291,7 +325,7 @@ _OPEN_SELECT = """
     SELECT
         '{{wname}}'  AS time_window,
         '{{lname}}'  AS lender,
-        COALESCE(CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END, 'ALL') AS user_type,
+        COALESCE(b.user_type, 'ALL') AS user_type,
 
         COUNT(DISTINCT b.mbkloanid)                                       AS basic_details,
         COUNT(DISTINCT a.mbkloanid)                                       AS address,
@@ -324,7 +358,7 @@ _OPEN_SELECT = """
     LEFT JOIN {sch}.lr_drawdown d ON d.mbkloanid=b.mbkloanid
 
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
-    GROUP BY CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END WITH ROLLUP
+    GROUP BY b.user_type WITH ROLLUP
 """.format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
 
 
@@ -341,49 +375,31 @@ _CLOSED_SELECT = """
     SELECT
         '{{wname}}'  AS time_window,
         '{{lname}}'  AS lender,
-        COALESCE(CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END, 'ALL') AS user_type,
+        COALESCE(b.user_type, 'ALL') AS user_type,
 
-        COUNT(DISTINCT b.mbkloanid)  AS basic_details,
-        COUNT(DISTINCT a.mbkloanid)  AS address,
-
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf1=1 THEN j.mbkloanid END) AS lpa_run,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf2=1 THEN j.mbkloanid END) AS lpa_pass,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf3=1 THEN j.mbkloanid END) AS pre_bre,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf4=1 THEN j.mbkloanid END) AS bureau_pull,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf5=1 THEN j.mbkloanid END) AS bre_success,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf6=1 THEN j.mbkloanid END) AS post_bre,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1 THEN j.mbkloanid END) AS pan_kyc,
-
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL THEN o.mbkloanid END) AS offer,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL THEN oa.mbkloanid END) AS offer_accepted,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
-              AND bk.mbkloanid IS NOT NULL THEN bk.mbkloanid END) AS bank,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
-              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL THEN n.mbkloanid END) AS nach,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
-              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
-              AND s.mbkloanid IS NOT NULL THEN s.mbkloanid END) AS sanction,
-        ROUND(COALESCE(SUM(CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
-              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
-              THEN s.amount ELSE 0 END),0)/{amt_div},2) AS sanction_amt_cr,
-        COUNT(DISTINCT CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
-              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
-              AND s.mbkloanid IS NOT NULL AND d.mbkloanid IS NOT NULL THEN d.mbkloanid END) AS drawdown,
-        ROUND(COALESCE(SUM(CASE WHEN a.mbkloanid IS NOT NULL AND j.cf7=1
-              AND o.mbkloanid IS NOT NULL AND oa.mbkloanid IS NOT NULL
-              AND bk.mbkloanid IS NOT NULL AND n.mbkloanid IS NOT NULL
-              AND s.mbkloanid IS NOT NULL
-              THEN d.amount ELSE 0 END),0)/{amt_div},2) AS drawdown_amt_cr
+        COUNT(DISTINCT b.mbkloanid)                                       AS basic_details,
+        COUNT(DISTINCT a.mbkloanid)                                       AS address,
+        COUNT(DISTINCT CASE WHEN j.cf1=1 THEN j.mbkloanid END)           AS lpa_run,
+        COUNT(DISTINCT CASE WHEN j.cf2=1 THEN j.mbkloanid END)           AS lpa_pass,
+        COUNT(DISTINCT CASE WHEN j.cf3=1 THEN j.mbkloanid END)           AS pre_bre,
+        COUNT(DISTINCT CASE WHEN j.cf4=1 THEN j.mbkloanid END)           AS bureau_pull,
+        COUNT(DISTINCT CASE WHEN j.cf5=1 THEN j.mbkloanid END)           AS bre_success,
+        COUNT(DISTINCT CASE WHEN j.cf6=1 THEN j.mbkloanid END)           AS post_bre,
+        COUNT(DISTINCT CASE WHEN j.cf7=1 THEN j.mbkloanid END)           AS pan_kyc,
+        COUNT(DISTINCT o.mbkloanid)                                       AS offer,
+        COUNT(DISTINCT oa.mbkloanid)                                      AS offer_accepted,
+        COUNT(DISTINCT bk.mbkloanid)                                      AS bank,
+        COUNT(DISTINCT n.mbkloanid)                                       AS nach,
+        COUNT(DISTINCT s.mbkloanid)                                       AS sanction,
+        ROUND(COALESCE(SUM(s.amount),0)/{amt_div},2)                     AS sanction_amt_cr,
+        COUNT(DISTINCT d.mbkloanid)                                       AS drawdown,
+        ROUND(COALESCE(SUM(d.amount),0)/{amt_div},2)                     AS drawdown_amt_cr
 
     FROM {sch}.lr_base b
-    LEFT JOIN {sch}.lr_address a ON a.mbkloanid=b.mbkloanid
+
+    LEFT JOIN {sch}.lr_address a
+        ON a.mbkloanid = b.mbkloanid                                      -- address ← base
+
     LEFT JOIN (
         SELECT mbkloanid,
             lpa_run                                                          AS cf1,
@@ -394,16 +410,31 @@ _CLOSED_SELECT = """
             lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre        AS cf6,
             lpa_run*lpa_pass*pre_bre*bureau_pull*bre_success*post_bre*pan_kyc AS cf7
         FROM {sch}.lr_journey WHERE lender_id={{lid}}
-    ) j ON j.mbkloanid=b.mbkloanid
-    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer WHERE lender_id={{lid}}) o ON o.mbkloanid=b.mbkloanid
-    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer_accept WHERE lender_id={{lid}}) oa ON oa.mbkloanid=b.mbkloanid
-    LEFT JOIN {sch}.lr_bank bk ON bk.mbkloanid=b.mbkloanid
-    LEFT JOIN {sch}.lr_nach n  ON n.mbkloanid=b.mbkloanid
-    LEFT JOIN (SELECT mbkloanid,SUM(amount) AS amount FROM {sch}.lr_sanction WHERE lender_id={{lid}} GROUP BY mbkloanid) s ON s.mbkloanid=b.mbkloanid
-    LEFT JOIN {sch}.lr_drawdown d ON d.mbkloanid=b.mbkloanid
+    ) j ON j.mbkloanid = a.mbkloanid                                      -- journey ← address
+
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer
+               WHERE lender_id={{lid}}) o
+        ON o.mbkloanid = j.mbkloanid AND j.cf7 = 1                        -- offer ← journey (all 7 stages)
+
+    LEFT JOIN (SELECT DISTINCT mbkloanid FROM {sch}.lr_offer_accept
+               WHERE lender_id={{lid}}) oa
+        ON oa.mbkloanid = o.mbkloanid                                      -- offer_accept ← offer
+
+    LEFT JOIN {sch}.lr_bank bk
+        ON bk.mbkloanid = oa.mbkloanid                                    -- bank ← offer_accept
+
+    LEFT JOIN {sch}.lr_nach n
+        ON n.mbkloanid = bk.mbkloanid                                     -- nach ← bank
+
+    LEFT JOIN (SELECT mbkloanid, SUM(amount) AS amount FROM {sch}.lr_sanction
+               WHERE lender_id={{lid}} GROUP BY mbkloanid) s
+        ON s.mbkloanid = n.mbkloanid                                       -- sanction ← nach
+
+    LEFT JOIN {sch}.lr_drawdown d
+        ON d.mbkloanid = s.mbkloanid                                       -- drawdown ← sanction
 
     WHERE b.createdat >= '{{wstart}}' AND b.createdat < '{{wend}}'
-    GROUP BY CASE WHEN b.first_seen >= '{{new_cutoff}}' THEN 'NEW' ELSE 'OLD' END WITH ROLLUP
+    GROUP BY b.user_type WITH ROLLUP
 """.format(sch=SCHEMA, amt_div=int(AMOUNT_DIVISOR))
 
 
@@ -433,9 +464,8 @@ def _create_summary(table_name, select_template):
     ]
     for lid, lname, _ in LENDER_ROWS:
         for wname, (wstart, wend) in windows.items():
-            new_cutoff = wstart[:7] + '-01 00:00:00'
             sql = select_template.format(wname=wname, lname=lname, lid=lid,
-                                         wstart=wstart, wend=wend, new_cutoff=new_cutoff)
+                                         wstart=wstart, wend=wend)
             stmts.append(f"INSERT INTO {SCHEMA}.{table_name} {sql}")
     run_sql(stmts)
 
@@ -685,7 +715,7 @@ def send_hourly_mail(**ctx):
         overall, lenderwise, unique_tof,
         windows=["today","mtd","lmtd"],
         wlabels={"today":"YTD","mtd":"MTD","lmtd":"LMTD"},
-        utypes=[("ALL","Overall"),("OLD","Repeat"),("NEW","New")],
+        utypes=[("ALL","Overall"),("Repeat","Repeat"),("New","New")],
         topline_cfgs=[
             ("Today vs Yesterday Topline Summary:","today","yesterday","TTN","YTN"),
             ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):","mtd","lmtd","MTD","LMTD"),
@@ -722,7 +752,7 @@ def _do_send_daily_open():
         overall, lenderwise, unique_tof,
         windows=["t_minus_1","mtd","lmtd"],
         wlabels={"t_minus_1":"T-1","mtd":"MTD","lmtd":"LMTD"},
-        utypes=[("ALL","Overall"),("OLD","Repeat"),("NEW","New")],
+        utypes=[("ALL","Overall"),("Repeat","Repeat"),("New","New")],
         topline_cfgs=[
             (f"T-1 Vs T-2 Topline Summary (Amounts are in ₹ Cr):","t_minus_1","t_minus_2","T-1","T-2"),
             ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):","mtd","lmtd","MTD","LMTD"),
@@ -759,7 +789,7 @@ def _do_send_closed_daily():
         overall, lenderwise, unique_tof,
         windows=["t_minus_1","mtd","lmtd"],
         wlabels={"t_minus_1":"T-1","mtd":"MTD","lmtd":"LMTD"},
-        utypes=[("ALL","Overall"),("OLD","Repeat"),("NEW","New")],
+        utypes=[("ALL","Overall"),("Repeat","Repeat"),("New","New")],
         topline_cfgs=[
             (f"T-1 Vs T-2 Topline Summary (Amounts are in ₹ Cr):","t_minus_1","t_minus_2","T-1","T-2"),
             ("MTD vs LMTD Topline Summary (Amounts are in ₹ Cr):","mtd","lmtd","MTD","LMTD"),
@@ -775,9 +805,10 @@ def _do_send_closed_daily():
 ###########################################################################
 
 def _run_full_pipeline():
-    """Run every step from scratch: lenders → base → steps → summaries."""
-    log.info("PIPELINE — creating lender ref table")
+    """Run every step from scratch: lenders → repeat_logic → base → steps → summaries."""
+    log.info("PIPELINE — creating lender ref + repeat logic tables")
     create_lenders()
+    create_repeat_logic()
 
     log.info("PIPELINE — creating base table")
     create_base()
@@ -842,8 +873,9 @@ dag = DAG(
 )
 
 # ── Step tables (shared by open + closed) ────────────────────────────
-t0  = PythonOperator(task_id="create_lenders",      python_callable=create_lenders,      dag=dag)
-t1  = PythonOperator(task_id="create_base",          python_callable=create_base,          dag=dag)
+t0  = PythonOperator(task_id="create_lenders",       python_callable=create_lenders,       dag=dag)
+t0r = PythonOperator(task_id="create_repeat_logic",  python_callable=create_repeat_logic,  dag=dag)
+t1  = PythonOperator(task_id="create_base",          python_callable=create_base,           dag=dag)
 t2  = PythonOperator(task_id="create_address",       python_callable=create_address,       dag=dag)
 t3  = PythonOperator(task_id="create_journey",       python_callable=create_journey,       dag=dag)
 t4  = PythonOperator(task_id="create_lender_det",    python_callable=create_lender_det,    dag=dag)
@@ -884,7 +916,7 @@ t21 = PythonOperator(task_id="test_daily_closed",    python_callable=test_closed
 #                          │                                    │
 #                          └──► closed_lenderwise → closed_overall → send_daily_closed
 
-t0 >> t1
+t0 >> t0r >> t1
 t1 >> [t2, t3, t4, t5, t7, t8, t9, t10, t11]
 t5 >> t6
 
