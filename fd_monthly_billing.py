@@ -168,6 +168,66 @@ def main():
     pivot["Grand Total"] = pivot.sum(axis=1)
     pivot = pivot.round(2)
 
+    # ── Build per-FD Working Sheet (one row per FD, month columns) ──
+    print("Building Working Sheet (per-FD calculation trace)…")
+
+    all_months = sorted(detail["month_label"].unique())
+
+    days_wide = detail.pivot_table(
+        index="transaction_id", columns="month_label",
+        values="active_days", aggfunc="sum", fill_value=0,
+    )
+    days_wide.columns = [f"Days_{c}" for c in days_wide.columns]
+
+    bill_wide = detail.pivot_table(
+        index="transaction_id", columns="month_label",
+        values="billing_amount", aggfunc="sum", fill_value=0,
+    )
+    bill_wide.columns = [f"Billing_{c}" for c in bill_wide.columns]
+
+    fd_totals = (
+        detail.groupby("transaction_id")
+        .agg(total_active_days=("active_days", "sum"),
+             total_billing=("billing_amount", "sum"))
+        .round(4)
+    )
+
+    source_cols = [
+        "transaction_id", "Partner", "fd_status", "interest_rate",
+        "created_at_ist", "maturity_at_ist", "updated_at_ist",
+        "amount", "maturity_amount", "interest_payout",
+    ]
+    source = valid[source_cols].set_index("transaction_id")
+    source["billing_rate"] = source["Partner"].map(BILLING_RATES).fillna(0)
+    source["used_fallback"] = source.index.isin(fallback_txn_ids)
+    source["days_diff"] = (
+        valid.set_index("transaction_id")["maturity_at_ist"]
+        - valid.set_index("transaction_id")["created_at_ist"]
+    ).dt.days
+
+    working = source.join(fd_totals).join(days_wide).join(bill_wide)
+    working = working.reset_index()
+
+    # Interleave Days and Billing columns per month for readability
+    static_cols = [
+        "transaction_id", "Partner", "fd_status", "amount",
+        "billing_rate", "interest_rate",
+        "created_at_ist", "maturity_at_ist", "updated_at_ist",
+        "used_fallback", "days_diff",
+        "total_active_days", "total_billing",
+    ]
+    month_cols = []
+    for m in all_months:
+        month_cols.append(f"Days_{m}")
+        month_cols.append(f"Billing_{m}")
+
+    ordered_cols = static_cols + month_cols
+    existing = [c for c in ordered_cols if c in working.columns]
+    working = working[existing]
+
+    print(f"Working Sheet: {len(working):,} rows × {len(existing)} columns "
+          f"({len(all_months)} months)\n")
+
     # ── Write single Excel workbook with multiple tabs ──
     out_file = "FD_Monthly_Billing.xlsx"
     with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
@@ -191,20 +251,15 @@ def main():
         # Tab 5: Grand Totals
         grand.to_excel(writer, sheet_name="Grand Totals", index=False)
 
-        # Tab 6: Detail (per-FD monthly line items)
+        # Tab 6: Working Sheet (per-FD calculation trace)
+        working.to_excel(writer, sheet_name="Working Sheet", index=False)
+
+        # Tab 7: Detail (per-FD × month long-format line items)
         detail.to_excel(writer, sheet_name="Detail", index=False)
 
-        # Tab 7: Fallback Records (used updated_at_ist as maturity)
-        fallback_df = valid[valid["transaction_id"].isin(fallback_txn_ids)].copy()
-        if not fallback_df.empty:
-            fallback_df.to_excel(writer, sheet_name="Fallback Records", index=False)
-
     print(f"Saved  → {out_file}")
-    tabs = ["Combined Summary", "Unity Monthly", "Suryoday Monthly",
-            "All Partners Summary", "Grand Totals", "Detail"]
-    if not fallback_df.empty:
-        tabs.append("Fallback Records")
-    print(f"  Tabs: {' | '.join(tabs)}")
+    print(f"  Tabs: Combined Summary | Unity Monthly | Suryoday Monthly |")
+    print(f"        All Partners Summary | Grand Totals | Working Sheet | Detail")
 
     # ── Console summary ──
     print("\n" + "=" * 65)
