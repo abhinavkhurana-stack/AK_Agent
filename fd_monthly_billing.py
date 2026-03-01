@@ -133,11 +133,6 @@ def main():
         .sort_values(["partner", "month_label"])
     )
     summary["total_billing"] = summary["total_billing"].round(2)
-    summary.to_csv("FD_Monthly_Billing_Summary.csv", index=False)
-    print("Saved  → FD_Monthly_Billing_Summary.csv  (partner × month summary)")
-
-    detail.to_csv("FD_Monthly_Billing_Detail.csv", index=False)
-    print("Saved  → FD_Monthly_Billing_Detail.csv   (per-FD monthly breakdown)")
 
     # ── Grand totals per partner ──
     grand = (
@@ -151,6 +146,54 @@ def main():
     )
     grand["total_billing"] = grand["total_billing"].round(2)
 
+    # ── Combined pivot ──
+    billable = summary[summary["partner"].isin(BILLING_RATES.keys())]
+    pivot = billable.pivot_table(
+        index="month_label",
+        columns="partner",
+        values="total_billing",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    pivot["Grand Total"] = pivot.sum(axis=1)
+    pivot = pivot.round(2)
+
+    # ── Write single Excel workbook with multiple tabs ──
+    out_file = "FD_Monthly_Billing.xlsx"
+    with pd.ExcelWriter(out_file, engine="openpyxl") as writer:
+
+        # Tab 1: Combined Summary (pivot by month with both lenders)
+        pivot_out = pivot.copy()
+        pivot_out.index.name = "Month"
+        pivot_out.to_excel(writer, sheet_name="Combined Summary")
+
+        # Tab 2: Unity Monthly
+        unity_data = summary[summary["partner"] == "Unity"].drop(columns=["partner"])
+        unity_data.to_excel(writer, sheet_name="Unity Monthly", index=False)
+
+        # Tab 3: Suryoday Monthly
+        suryoday_data = summary[summary["partner"] == "Suryoday"].drop(columns=["partner"])
+        suryoday_data.to_excel(writer, sheet_name="Suryoday Monthly", index=False)
+
+        # Tab 4: All Partners Summary (including those without rates)
+        summary.to_excel(writer, sheet_name="All Partners Summary", index=False)
+
+        # Tab 5: Grand Totals
+        grand.to_excel(writer, sheet_name="Grand Totals", index=False)
+
+        # Tab 6: Detail (per-FD monthly line items)
+        detail.to_excel(writer, sheet_name="Detail", index=False)
+
+        # Tab 7: Skipped Records (bad/null maturity)
+        skipped = df[~df["transaction_id"].isin(valid["transaction_id"])].copy()
+        if not skipped.empty:
+            skipped.to_excel(writer, sheet_name="Skipped Records", index=False)
+
+    print(f"Saved  → {out_file}")
+    print(f"  Tabs: Combined Summary | Unity Monthly | Suryoday Monthly |"
+          f" All Partners Summary | Grand Totals | Detail | Skipped Records")
+
+    # ── Console summary ──
     print("\n" + "=" * 65)
     print("GRAND TOTAL BILLING PER PARTNER")
     print("=" * 65)
@@ -160,7 +203,6 @@ def main():
             rate_str += " (rate TBD)"
         print(f"  {r['partner']:20s}  Rate: {rate_str:16s}  Billing: ₹{r['total_billing']:>14,.2f}")
 
-    # ── Monthly QC for Unity + Suryoday ──
     for partner_name in ["Unity", "Suryoday"]:
         partner_data = summary[summary["partner"] == partner_name].copy()
         if partner_data.empty:
@@ -178,27 +220,15 @@ def main():
         print(f"  {'-'*10} {'-'*10} {'-'*20} {'-'*14} {'-'*16}")
         print(f"  {'TOTAL':<10} {'':>10} {'':>20} {'':>14} {total_billing:>16,.2f}")
 
-    # ── Combined pivot ──
     print(f"\n{'=' * 65}")
     print("COMBINED MONTHLY SNAPSHOT (Unity + Suryoday)")
     print("=" * 65)
-    billable = summary[summary["partner"].isin(BILLING_RATES.keys())]
-    pivot = billable.pivot_table(
-        index="month_label",
-        columns="partner",
-        values="total_billing",
-        aggfunc="sum",
-        fill_value=0,
-    )
-    pivot["Grand Total"] = pivot.sum(axis=1)
-    pivot = pivot.round(2)
     print(pivot.to_string())
 
     print(f"\n  Unity total     : ₹{pivot.get('Unity', pd.Series([0])).sum():>14,.2f}")
     print(f"  Suryoday total  : ₹{pivot.get('Suryoday', pd.Series([0])).sum():>14,.2f}")
     print(f"  Combined total  : ₹{pivot['Grand Total'].sum():>14,.2f}")
 
-    # ── Partners without rates ──
     unrated = set(valid["Partner"].unique()) - set(BILLING_RATES.keys())
     if unrated:
         print(f"\n⚠  No billing rate defined for: {', '.join(sorted(unrated))}")
