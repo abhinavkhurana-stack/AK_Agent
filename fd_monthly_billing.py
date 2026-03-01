@@ -28,9 +28,13 @@ Active-window rules (start-date inclusive, end-date EXCLUSIVE):
       WITHDRAW              → updated_at_ist
       OPEN / IN_PROGRESS    → report_cutoff + 1 day
 
-Using an *exclusive* end-date means:
-  – No extra day is counted (end-date itself is the first day FD no longer exists)
-  – No eligible day is missed (every day from start up to end-1 is counted)
+  The min() for MATURED handles premature closures.  The min() for WITHDRAW
+  caps billing at maturity even when withdrawal was processed later.
+
+Data quality:
+  • 393 exact-duplicate rows in source are deduplicated on transaction_id.
+  • 179 records with clearly invalid maturity dates (years 2001-2012) fall
+    back to investment_period / updated_at_ist.
 
 Billing rates (annual, as provided):
   Unity    → 0.50 %
@@ -59,8 +63,7 @@ def compute_end_date(row, created_date):
 
     Primary source: maturity_at_ist from the data.
     Fallback: calculated from investment_period / updated_at_ist when maturity
-    is missing or clearly invalid (before creation date — ~179 records with
-    system-error dates in 2001–2012).
+    is missing or clearly invalid (before creation date).
     """
     status = row["fd_status"]
     period = row["investment_period"]
@@ -125,14 +128,18 @@ def monthly_breakdown(start_date, end_date_excl):
 
 def main():
     df = pd.read_csv("FD_base.csv")
-    print(f"Loaded {len(df):,} FD records  (all statuses including IN_PROGRESS)")
+    raw_count = len(df)
 
     df["created_at_ist"] = pd.to_datetime(df["created_at_ist"])
     df["updated_at_ist"] = pd.to_datetime(df["updated_at_ist"])
     df["investment_period"] = df["investment_period"].fillna(0)
 
-    print(f"Status breakdown: {df['fd_status'].value_counts().to_dict()}")
-    print(f"Partner breakdown: {df['Partner'].value_counts().to_dict()}\n")
+    dup_count = raw_count - df["transaction_id"].nunique()
+    df = df.drop_duplicates(subset="transaction_id", keep="first")
+
+    print(f"Loaded {raw_count:,} rows → {len(df):,} unique FDs (removed {dup_count} duplicates)")
+    print(f"Status: {df['fd_status'].value_counts().to_dict()}")
+    print(f"Partners: {df['Partner'].value_counts().to_dict()}\n")
 
     rows = []
     skipped = 0
@@ -187,7 +194,6 @@ def main():
     summary.to_csv("FD_Monthly_Billing_Summary.csv", index=False)
     print("Saved  → FD_Monthly_Billing_Summary.csv  (partner × month summary)")
 
-    # ── Detail: every FD × month row ──
     detail.to_csv("FD_Monthly_Billing_Detail.csv", index=False)
     print("Saved  → FD_Monthly_Billing_Detail.csv   (per-FD monthly breakdown)")
 
