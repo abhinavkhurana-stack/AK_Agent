@@ -23,8 +23,12 @@ Records skipped:
   • maturity_at_ist < created_at_ist  (bad data — ~14-179 records)
 
 Billing rates (annual):
-  Unity    → 0.50 %
-  Suryoday → 0.35 %
+  Unity             → 0.50 %
+  Suryoday          → 0.35 %
+  Bajaj Finance Ltd → 0.58 %
+  Shriram Finance   → 0.35 %
+  Shivalik          → 0.15 %
+  Mahindra Finance  → not provided
 """
 
 import calendar
@@ -38,6 +42,9 @@ warnings.filterwarnings("ignore")
 BILLING_RATES = {
     "Unity": 0.50 / 100,
     "Suryoday": 0.35 / 100,
+    "Bajaj Finance Ltd": 0.58 / 100,
+    "Shriram Finance": 0.35 / 100,
+    "Shivalik": 0.15 / 100,
 }
 
 REPORT_CUTOFF = date(2026, 3, 1)
@@ -237,13 +244,15 @@ def main():
         pivot_out.index.name = "Month"
         pivot_out.to_excel(writer, sheet_name="Combined Summary")
 
-        # Tab 2: Unity Monthly
-        unity_data = summary[summary["partner"] == "Unity"].drop(columns=["partner"])
-        unity_data.to_excel(writer, sheet_name="Unity Monthly", index=False)
-
-        # Tab 3: Suryoday Monthly
-        suryoday_data = summary[summary["partner"] == "Suryoday"].drop(columns=["partner"])
-        suryoday_data.to_excel(writer, sheet_name="Suryoday Monthly", index=False)
+        # Per-partner monthly tabs for each rated partner
+        for pname in BILLING_RATES:
+            pdata = summary[summary["partner"] == pname]
+            if pdata.empty:
+                continue
+            sheet = pname.replace(" ", "")[:28]  # Excel 31-char limit
+            pdata.drop(columns=["partner"]).to_excel(
+                writer, sheet_name=sheet, index=False
+            )
 
         # Tab 4: All Partners Summary (including those without rates)
         summary.to_excel(writer, sheet_name="All Partners Summary", index=False)
@@ -271,7 +280,7 @@ def main():
             rate_str += " (rate TBD)"
         print(f"  {r['partner']:20s}  Rate: {rate_str:16s}  Billing: ₹{r['total_billing']:>14,.2f}")
 
-    for partner_name in ["Unity", "Suryoday"]:
+    for partner_name in BILLING_RATES:
         partner_data = summary[summary["partner"] == partner_name].copy()
         if partner_data.empty:
             continue
