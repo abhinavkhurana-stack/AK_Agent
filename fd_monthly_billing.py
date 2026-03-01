@@ -77,17 +77,27 @@ def main():
 
     df["created_at_ist"] = pd.to_datetime(df["created_at_ist"])
     df["maturity_at_ist"] = pd.to_datetime(df["maturity_at_ist"])
+    df["updated_at_ist"] = pd.to_datetime(df["updated_at_ist"])
 
     dup_count = raw_count - df["transaction_id"].nunique()
     df = df.drop_duplicates(subset="transaction_id", keep="first")
 
-    null_mat = df["maturity_at_ist"].isna().sum()
-    bad_mat = (df["maturity_at_ist"] < df["created_at_ist"]).sum()
-    valid = df[df["maturity_at_ist"].notna() & (df["maturity_at_ist"] >= df["created_at_ist"])].copy()
+    # For null/bad maturity: fall back to updated_at_ist
+    bad_mask = df["maturity_at_ist"].isna() | (df["maturity_at_ist"] < df["created_at_ist"])
+    fallback_count = bad_mask.sum()
+    fallback_txn_ids = set(df.loc[bad_mask, "transaction_id"])
+    df.loc[bad_mask, "maturity_at_ist"] = df.loc[bad_mask, "updated_at_ist"]
+
+    # After fallback, drop any still-invalid (updated also bad)
+    still_bad = df["maturity_at_ist"].isna() | (df["maturity_at_ist"] < df["created_at_ist"])
+    skipped_count = still_bad.sum()
+    valid = df[~still_bad].copy()
 
     print(f"Loaded {raw_count:,} rows → {len(df):,} unique FDs (removed {dup_count} duplicates)")
-    print(f"Skipped: {null_mat} null maturity + {bad_mat} bad maturity (maturity < created)")
-    print(f"Processing: {len(valid):,} FDs with valid date ranges")
+    print(f"Fallback: {fallback_count} records used updated_at_ist as maturity (null/bad maturity)")
+    if skipped_count:
+        print(f"Skipped: {skipped_count} records still invalid after fallback")
+    print(f"Processing: {len(valid):,} FDs")
     print(f"Status: {valid['fd_status'].value_counts().to_dict()}")
     print(f"Partners: {valid['Partner'].value_counts().to_dict()}\n")
 
@@ -184,14 +194,17 @@ def main():
         # Tab 6: Detail (per-FD monthly line items)
         detail.to_excel(writer, sheet_name="Detail", index=False)
 
-        # Tab 7: Skipped Records (bad/null maturity)
-        skipped = df[~df["transaction_id"].isin(valid["transaction_id"])].copy()
-        if not skipped.empty:
-            skipped.to_excel(writer, sheet_name="Skipped Records", index=False)
+        # Tab 7: Fallback Records (used updated_at_ist as maturity)
+        fallback_df = valid[valid["transaction_id"].isin(fallback_txn_ids)].copy()
+        if not fallback_df.empty:
+            fallback_df.to_excel(writer, sheet_name="Fallback Records", index=False)
 
     print(f"Saved  → {out_file}")
-    print(f"  Tabs: Combined Summary | Unity Monthly | Suryoday Monthly |"
-          f" All Partners Summary | Grand Totals | Detail | Skipped Records")
+    tabs = ["Combined Summary", "Unity Monthly", "Suryoday Monthly",
+            "All Partners Summary", "Grand Totals", "Detail"]
+    if not fallback_df.empty:
+        tabs.append("Fallback Records")
+    print(f"  Tabs: {' | '.join(tabs)}")
 
     # ── Console summary ──
     print("\n" + "=" * 65)
