@@ -16,20 +16,21 @@ particular month*.
 
 Active-window rules (start-date inclusive, end-date EXCLUSIVE):
   • Start  = date(created_at_ist)           — first day principal is deployed
-  • End depends on fd_status:
-      MATURED (period > 0)  → min(created + period months, updated_at_ist)
-      MATURED (period == 0) → date(updated_at_ist)   (flexi / 7-day FDs)
-      WITHDRAW              → date(updated_at_ist)    (premature closure)
-      OPEN                  → min(maturity, report_cutoff + 1 day)
-      IN_PROGRESS           → EXCLUDED (FD not yet live)
+  • End depends on fd_status and uses maturity_at_ist from the data:
+      MATURED      → maturity_at_ist
+      WITHDRAW     → min(maturity_at_ist, updated_at_ist)
+      OPEN         → min(maturity_at_ist, report_cutoff + 1 day)
+      IN_PROGRESS  → min(maturity_at_ist, report_cutoff + 1 day)
 
-  The min() for MATURED handles ~90 FDs marked MATURED well before their
-  contractual maturity (premature bank-side closure).
+  Fallback when maturity_at_ist is null or invalid (< created_at_ist):
+      MATURED  (period > 0) → min(created + period months, updated_at_ist)
+      MATURED  (period = 0) → updated_at_ist
+      WITHDRAW              → updated_at_ist
+      OPEN / IN_PROGRESS    → report_cutoff + 1 day
 
 Using an *exclusive* end-date means:
-  – No extra day is counted (the end-date itself is the first day the FD no
-    longer exists).
-  – No eligible day is missed (every day from start up to end-1 is counted).
+  – No extra day is counted (end-date itself is the first day FD no longer exists)
+  – No eligible day is missed (every day from start up to end-1 is counted)
 
 Billing rates (annual, as provided):
   Unity    → 0.50 %
@@ -54,34 +55,45 @@ REPORT_CUTOFF = date(2026, 3, 1)
 
 
 def compute_end_date(row, created_date):
-    """Return the exclusive end-date for billing (first day the FD is no longer active).
+    """Return the exclusive end-date for billing.
 
-    For MATURED FDs with period > 0, we take the *earlier* of the calculated
-    maturity date and updated_at_ist.  This correctly handles premature closures
-    (FD marked MATURED well before calculated maturity) while still using the
-    contractual maturity for normal FDs (updated_at is at or after maturity).
+    Primary source: maturity_at_ist from the data.
+    Fallback: calculated from investment_period / updated_at_ist when maturity
+    is missing or clearly invalid (before creation date — ~179 records with
+    system-error dates in 2001–2012).
     """
     status = row["fd_status"]
     period = row["investment_period"]
     updated = pd.to_datetime(row["updated_at_ist"]).date()
 
-    if status == "IN_PROGRESS":
-        return None
+    mat_raw = row["maturity_at_ist"]
+    has_valid_maturity = pd.notna(mat_raw)
+    if has_valid_maturity:
+        maturity = pd.to_datetime(mat_raw).date()
+        if maturity <= created_date:
+            has_valid_maturity = False
 
-    if status == "MATURED":
-        if period > 0:
-            maturity = created_date + relativedelta(months=int(period))
+    cutoff_end = REPORT_CUTOFF + timedelta(days=1)
+
+    if has_valid_maturity:
+        if status == "MATURED":
+            return maturity
+        if status == "WITHDRAW":
             return min(maturity, updated)
-        return updated
-
-    if status == "WITHDRAW":
-        return updated
-
-    if status == "OPEN":
-        if period > 0:
-            maturity = created_date + relativedelta(months=int(period))
-            return min(maturity, REPORT_CUTOFF + timedelta(days=1))
-        return REPORT_CUTOFF + timedelta(days=1)
+        if status in ("OPEN", "IN_PROGRESS"):
+            return min(maturity, cutoff_end)
+    else:
+        if status == "MATURED":
+            if period > 0:
+                return min(created_date + relativedelta(months=int(period)), updated)
+            return updated
+        if status == "WITHDRAW":
+            return updated
+        if status in ("OPEN", "IN_PROGRESS"):
+            if period > 0:
+                calc_mat = created_date + relativedelta(months=int(period))
+                return min(calc_mat, cutoff_end)
+            return cutoff_end
 
     return None
 
@@ -112,17 +124,15 @@ def monthly_breakdown(start_date, end_date_excl):
 
 
 def main():
-    df = pd.read_csv("FD_Base.csv")
-    print(f"Loaded {len(df):,} FD records")
+    df = pd.read_csv("FD_base.csv")
+    print(f"Loaded {len(df):,} FD records  (all statuses including IN_PROGRESS)")
 
     df["created_at_ist"] = pd.to_datetime(df["created_at_ist"])
     df["updated_at_ist"] = pd.to_datetime(df["updated_at_ist"])
     df["investment_period"] = df["investment_period"].fillna(0)
 
-    excluded_in_progress = (df["fd_status"] == "IN_PROGRESS").sum()
-    df = df[df["fd_status"] != "IN_PROGRESS"].copy()
-    print(f"Excluded {excluded_in_progress} IN_PROGRESS FDs (not yet live)")
-    print(f"Processing {len(df):,} active/closed FDs\n")
+    print(f"Status breakdown: {df['fd_status'].value_counts().to_dict()}")
+    print(f"Partner breakdown: {df['Partner'].value_counts().to_dict()}\n")
 
     rows = []
     skipped = 0
@@ -202,8 +212,27 @@ def main():
             rate_str += " (rate TBD)"
         print(f"  {r['partner']:20s}  Rate: {rate_str:16s}  Billing: ₹{r['total_billing']:>14,.2f}")
 
-    print("\n" + "=" * 65)
-    print("MONTHLY BILLING SNAPSHOT (Unity + Suryoday)")
+    # ── Monthly QC for Unity + Suryoday ──
+    for partner_name in ["Unity", "Suryoday"]:
+        partner_data = summary[summary["partner"] == partner_name].copy()
+        if partner_data.empty:
+            continue
+        rate_pct = BILLING_RATES[partner_name] * 100
+        print(f"\n{'=' * 90}")
+        print(f"  MONTHLY BILLING — {partner_name.upper()} (Rate: {rate_pct:.2f}%)")
+        print(f"{'=' * 90}")
+        print(f"  {'Month':<10} {'FD Count':>10} {'Total Amount (₹)':>20} {'Active Days':>14} {'Billing (₹)':>16}")
+        print(f"  {'-'*10} {'-'*10} {'-'*20} {'-'*14} {'-'*16}")
+        total_billing = 0
+        for _, row in partner_data.iterrows():
+            print(f"  {row['month_label']:<10} {row['fd_count']:>10,} {row['total_amount']:>20,.0f} {row['total_active_days']:>14,} {row['total_billing']:>16,.2f}")
+            total_billing += row["total_billing"]
+        print(f"  {'-'*10} {'-'*10} {'-'*20} {'-'*14} {'-'*16}")
+        print(f"  {'TOTAL':<10} {'':>10} {'':>20} {'':>14} {total_billing:>16,.2f}")
+
+    # ── Combined pivot ──
+    print(f"\n{'=' * 65}")
+    print("COMBINED MONTHLY SNAPSHOT (Unity + Suryoday)")
     print("=" * 65)
     billable = summary[summary["partner"].isin(BILLING_RATES.keys())]
     pivot = billable.pivot_table(
