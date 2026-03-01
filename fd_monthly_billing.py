@@ -3,40 +3,26 @@ Fixed Deposit Monthly Billing Calculator
 =========================================
 Calculates monthly billing revenue per lender/partner from FD data.
 
-Approach
---------
-For each FD, determine the "active window" — the date range during which the
-FD principal was deployed with the partner.  Then, for every calendar month
-that overlaps with that window, compute:
+Methodology  (matches the manual Excel calculation in FD_data_new_v3)
+--------------------------------------------------------------------------
+For each FD the "active window" is:
 
-    billing = amount × billing_rate × days_in_month / 365
+    [created_at_ist  …  maturity_at_ist]      ← both dates INCLUSIVE
 
-where `days_in_month` is the number of days the FD was active *in that
-particular month*.
+Every calendar month that overlaps with that window is billed:
 
-Active-window rules (start-date inclusive, end-date EXCLUSIVE):
-  • Start  = date(created_at_ist)           — first day principal is deployed
-  • End depends on fd_status and uses maturity_at_ist from the data:
-      MATURED      → maturity_at_ist
-      WITHDRAW     → min(maturity_at_ist, updated_at_ist)
-      OPEN         → min(maturity_at_ist, report_cutoff + 1 day)
-      IN_PROGRESS  → min(maturity_at_ist, report_cutoff + 1 day)
+    billing = amount × rate × active_days_in_month / 365
 
-  Fallback when maturity_at_ist is null or invalid (< created_at_ist):
-      MATURED  (period > 0) → min(created + period months, updated_at_ist)
-      MATURED  (period = 0) → updated_at_ist
-      WITHDRAW              → updated_at_ist
-      OPEN / IN_PROGRESS    → report_cutoff + 1 day
+where active_days_in_month = min(maturity, month_end) − max(created, month_start) + 1
 
-  The min() for MATURED handles premature closures.  The min() for WITHDRAW
-  caps billing at maturity even when withdrawal was processed later.
+Rules applied uniformly to ALL fd_status values (OPEN, MATURED, WITHDRAW,
+IN_PROGRESS) — no special-casing by status.  Only the two dates matter.
 
-Data quality:
-  • 393 exact-duplicate rows in source are deduplicated on transaction_id.
-  • 179 records with clearly invalid maturity dates (years 2001-2012) fall
-    back to investment_period / updated_at_ist.
+Records skipped:
+  • maturity_at_ist is null   (mostly IN_PROGRESS without a maturity yet)
+  • maturity_at_ist < created_at_ist  (bad data — ~14-179 records)
 
-Billing rates (annual, as provided):
+Billing rates (annual):
   Unity    → 0.50 %
   Suryoday → 0.35 %
 """
@@ -46,7 +32,6 @@ import warnings
 from datetime import date, timedelta
 
 import pandas as pd
-from dateutil.relativedelta import relativedelta
 
 warnings.filterwarnings("ignore")
 
@@ -58,63 +43,23 @@ BILLING_RATES = {
 REPORT_CUTOFF = date(2026, 3, 1)
 
 
-def compute_end_date(row, created_date):
-    """Return the exclusive end-date for billing.
+def monthly_breakdown(start_date, end_date_incl):
+    """Yield (year, month, days) for every calendar month the FD overlaps.
 
-    Primary source: maturity_at_ist from the data.
-    Fallback: calculated from investment_period / updated_at_ist when maturity
-    is missing or clearly invalid (before creation date).
+    Both start_date and end_date_incl are INCLUSIVE.
     """
-    status = row["fd_status"]
-    period = row["investment_period"]
-    updated = pd.to_datetime(row["updated_at_ist"]).date()
-
-    mat_raw = row["maturity_at_ist"]
-    has_valid_maturity = pd.notna(mat_raw)
-    if has_valid_maturity:
-        maturity = pd.to_datetime(mat_raw).date()
-        if maturity <= created_date:
-            has_valid_maturity = False
-
-    cutoff_end = REPORT_CUTOFF + timedelta(days=1)
-
-    if has_valid_maturity:
-        if status == "MATURED":
-            return maturity
-        if status == "WITHDRAW":
-            return min(maturity, updated)
-        if status in ("OPEN", "IN_PROGRESS"):
-            return min(maturity, cutoff_end)
-    else:
-        if status == "MATURED":
-            if period > 0:
-                return min(created_date + relativedelta(months=int(period)), updated)
-            return updated
-        if status == "WITHDRAW":
-            return updated
-        if status in ("OPEN", "IN_PROGRESS"):
-            if period > 0:
-                calc_mat = created_date + relativedelta(months=int(period))
-                return min(calc_mat, cutoff_end)
-            return cutoff_end
-
-    return None
-
-
-def monthly_breakdown(start_date, end_date_excl):
-    """Yield (year, month, days) for every calendar month the FD overlaps."""
-    if end_date_excl <= start_date:
+    end_excl = end_date_incl + timedelta(days=1)
+    if end_excl <= start_date:
         return
 
     cur = start_date.replace(day=1)
-    while cur < end_date_excl:
+    while cur < end_excl:
         y, m = cur.year, cur.month
         month_first = date(y, m, 1)
-        month_last = date(y, m, calendar.monthrange(y, m)[1])
-        month_end_excl = month_last + timedelta(days=1)
+        month_end_excl = date(y, m, calendar.monthrange(y, m)[1]) + timedelta(days=1)
 
         active_start = max(start_date, month_first)
-        active_end_excl = min(end_date_excl, month_end_excl)
+        active_end_excl = min(end_excl, month_end_excl)
         days = (active_end_excl - active_start).days
 
         if days > 0:
@@ -131,33 +76,33 @@ def main():
     raw_count = len(df)
 
     df["created_at_ist"] = pd.to_datetime(df["created_at_ist"])
-    df["updated_at_ist"] = pd.to_datetime(df["updated_at_ist"])
-    df["investment_period"] = df["investment_period"].fillna(0)
+    df["maturity_at_ist"] = pd.to_datetime(df["maturity_at_ist"])
 
     dup_count = raw_count - df["transaction_id"].nunique()
     df = df.drop_duplicates(subset="transaction_id", keep="first")
 
+    null_mat = df["maturity_at_ist"].isna().sum()
+    bad_mat = (df["maturity_at_ist"] < df["created_at_ist"]).sum()
+    valid = df[df["maturity_at_ist"].notna() & (df["maturity_at_ist"] >= df["created_at_ist"])].copy()
+
     print(f"Loaded {raw_count:,} rows → {len(df):,} unique FDs (removed {dup_count} duplicates)")
-    print(f"Status: {df['fd_status'].value_counts().to_dict()}")
-    print(f"Partners: {df['Partner'].value_counts().to_dict()}\n")
+    print(f"Skipped: {null_mat} null maturity + {bad_mat} bad maturity (maturity < created)")
+    print(f"Processing: {len(valid):,} FDs with valid date ranges")
+    print(f"Status: {valid['fd_status'].value_counts().to_dict()}")
+    print(f"Partners: {valid['Partner'].value_counts().to_dict()}\n")
 
     rows = []
-    skipped = 0
 
-    for idx, row in df.iterrows():
+    for _, row in valid.iterrows():
         created = row["created_at_ist"].date()
-        end_excl = compute_end_date(row, created)
-
-        if end_excl is None or end_excl <= created:
-            skipped += 1
-            continue
+        maturity = row["maturity_at_ist"].date()
 
         partner = row["Partner"]
         amount = row["amount"]
         rate = BILLING_RATES.get(partner, 0)
         txn_id = row["transaction_id"]
 
-        for y, m, days in monthly_breakdown(created, end_excl):
+        for y, m, days in monthly_breakdown(created, maturity):
             billing_amount = amount * rate * days / 365
             rows.append({
                 "partner": partner,
@@ -169,11 +114,8 @@ def main():
                 "amount": amount,
                 "billing_rate": rate,
                 "active_days": days,
-                "billing_amount": round(billing_amount, 2),
+                "billing_amount": round(billing_amount, 4),
             })
-
-    if skipped:
-        print(f"Skipped {skipped} records with invalid date ranges (end <= start)\n")
 
     detail = pd.DataFrame(rows)
     print(f"Generated {len(detail):,} monthly line items\n")
@@ -230,9 +172,9 @@ def main():
         print(f"  {'Month':<10} {'FD Count':>10} {'Total Amount (₹)':>20} {'Active Days':>14} {'Billing (₹)':>16}")
         print(f"  {'-'*10} {'-'*10} {'-'*20} {'-'*14} {'-'*16}")
         total_billing = 0
-        for _, row in partner_data.iterrows():
-            print(f"  {row['month_label']:<10} {row['fd_count']:>10,} {row['total_amount']:>20,.0f} {row['total_active_days']:>14,} {row['total_billing']:>16,.2f}")
-            total_billing += row["total_billing"]
+        for _, r in partner_data.iterrows():
+            print(f"  {r['month_label']:<10} {r['fd_count']:>10,} {r['total_amount']:>20,.0f} {r['total_active_days']:>14,} {r['total_billing']:>16,.2f}")
+            total_billing += r["total_billing"]
         print(f"  {'-'*10} {'-'*10} {'-'*20} {'-'*14} {'-'*16}")
         print(f"  {'TOTAL':<10} {'':>10} {'':>20} {'':>14} {total_billing:>16,.2f}")
 
@@ -257,7 +199,7 @@ def main():
     print(f"  Combined total  : ₹{pivot['Grand Total'].sum():>14,.2f}")
 
     # ── Partners without rates ──
-    unrated = set(df["Partner"].unique()) - set(BILLING_RATES.keys())
+    unrated = set(valid["Partner"].unique()) - set(BILLING_RATES.keys())
     if unrated:
         print(f"\n⚠  No billing rate defined for: {', '.join(sorted(unrated))}")
         print("   Their billing shows as ₹0.  Provide rates to include them.")
