@@ -96,11 +96,19 @@ def compute_windows():
     db4y_00   = today_00 - timedelta(days=2)
 
     mtd_start    = today_00.replace(day=1)
-    mtd_end      = now                                     # include today's partial data
-    lmtd_start   = (mtd_start - timedelta(days=1)).replace(day=1)
-    max_prev_day = calendar.monthrange(lmtd_start.year, lmtd_start.month)[1]
-    lmtd_end_day = min(today_00.day, max_prev_day)         # today's day-of-month (not T-1's)
-    lmtd_end     = lmtd_start.replace(day=lmtd_end_day) + timedelta(days=1)
+    if today_00 == mtd_start:
+        # 1st of month: MTD = full previous month, LMTD = full month before that
+        mtd_start  = (today_00 - timedelta(days=1)).replace(day=1)           # e.g. Feb 1
+        mtd_end    = today_00                                                 # e.g. Mar 1
+        lmtd_start = (mtd_start - timedelta(days=1)).replace(day=1)          # e.g. Jan 1
+        lmtd_end   = mtd_start                                               # e.g. Feb 1
+    else:
+        # Normal day: MTD = 1st of month to T-1, LMTD = same span in prev month
+        mtd_end      = today_00                                               # through T-1
+        lmtd_start   = (mtd_start - timedelta(days=1)).replace(day=1)
+        t1_day       = (today_00 - timedelta(days=1)).day
+        max_prev_day = calendar.monthrange(lmtd_start.year, lmtd_start.month)[1]
+        lmtd_end     = lmtd_start.replace(day=min(t1_day, max_prev_day)) + timedelta(days=1)
 
     new_user_cutoff = _fmt(mtd_start)
 
