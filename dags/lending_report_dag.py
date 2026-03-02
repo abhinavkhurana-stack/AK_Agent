@@ -96,11 +96,11 @@ def compute_windows():
     db4y_00   = today_00 - timedelta(days=2)
 
     mtd_start    = today_00.replace(day=1)
-    mtd_end      = today_00
+    mtd_end      = now                                     # include today's partial data
     lmtd_start   = (mtd_start - timedelta(days=1)).replace(day=1)
-    t1_day       = (today_00 - timedelta(days=1)).day
     max_prev_day = calendar.monthrange(lmtd_start.year, lmtd_start.month)[1]
-    lmtd_end     = lmtd_start.replace(day=min(t1_day, max_prev_day)) + timedelta(days=1)
+    lmtd_end_day = min(today_00.day, max_prev_day)         # today's day-of-month (not T-1's)
+    lmtd_end     = lmtd_start.replace(day=lmtd_end_day) + timedelta(days=1)
 
     new_user_cutoff = _fmt(mtd_start)
 
@@ -1019,8 +1019,7 @@ def _do_send_daily_open():
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_lenderwise", engine)
     unique_tof = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')", engine)
 
-    t1 = (now - timedelta(days=1)).strftime("%d-%b-%Y")
-    subj = f"Daily Lending Summary - EMI Open Funnel BBK || {t1}"
+    subj = f"Daily Lending Summary - EMI Open Funnel BBK || {now.strftime('%d-%b-%Y')}"
     body = _build_body(
         overall, lenderwise, unique_tof,
         windows=["t_minus_1","mtd","lmtd"],
@@ -1056,8 +1055,7 @@ def _do_send_closed_daily():
     lenderwise = pd.read_sql(f"SELECT * FROM {SCHEMA}.lrc_lenderwise", engine)
     unique_tof = pd.read_sql(f"SELECT * FROM {SCHEMA}.lr_unique_tof WHERE time_window IN ('t_minus_1','t_minus_2','mtd','lmtd')", engine)
 
-    t1 = (now - timedelta(days=1)).strftime("%d-%b-%Y")
-    subj = f"Daily Lending Summary - EMI Closed Funnel BBK || {t1}"
+    subj = f"Daily Lending Summary - EMI Closed Funnel BBK || {now.strftime('%d-%b-%Y')}"
     body = _build_body(
         overall, lenderwise, unique_tof,
         windows=["t_minus_1","mtd","lmtd"],
