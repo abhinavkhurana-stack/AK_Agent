@@ -6,8 +6,11 @@ Calculates monthly billing revenue per lender/partner from FD data.
 Billing methodology:
   BANKS  (Unity, Suryoday, Shivalik):
       billing = amount × rate × active_days_in_month / 365
-      Active window is [created_at … maturity_at], both dates INCLUSIVE.
-      Billing is spread across every calendar month overlapping that window.
+      Active window depends on fd_status:
+        OPEN / MATURED / IN_PROGRESS → [created_at … maturity_at]
+        WITHDRAW → [created_at … min(updated_at, maturity_at)]
+      Both endpoints INCLUSIVE.  Billing is spread across every
+      calendar month overlapping that window.
 
   NBFCs  (Bajaj Finance Ltd, Shriram Finance, Mahindra Finance):
       billing = amount × rate   (UPFRONT, all in booking month)
@@ -326,6 +329,8 @@ def main():
     TARGET_END = date(2026, 2, 28)
 
     print("\nComputing monthly billing...")
+    withdraw_count = (valid["fd_status"] == "WITHDRAW").sum()
+    print(f"  WITHDRAW FDs: {withdraw_count} (will use withdrawal date as end)")
     rows = []
     for _, row in valid.iterrows():
         created = row["created_at_ist"].date()
@@ -334,7 +339,14 @@ def main():
         amount = row["amount"]
         rate = row["billing_rate_new"]
         txn_id = row["transaction_id"]
+        status = row["fd_status"]
         is_nbfc = partner in NBFC_PARTNERS
+
+        if status == "WITHDRAW":
+            withdrawn_at = row["updated_at_ist"].date()
+            effective_end = min(withdrawn_at, maturity)
+        else:
+            effective_end = maturity
 
         if is_nbfc:
             booking_month = f"{created.year}-{created.month:02d}"
@@ -345,14 +357,14 @@ def main():
                 "month": created.month,
                 "month_label": booking_month,
                 "transaction_id": txn_id,
-                "fd_status": row["fd_status"],
+                "fd_status": status,
                 "amount": amount,
                 "billing_rate": rate,
                 "active_days": 1,
                 "billing_amount": billing_amount,
             })
         else:
-            end_date = min(maturity, TARGET_END)
+            end_date = min(effective_end, TARGET_END)
             for y, m, days in monthly_breakdown(created, end_date):
                 ml = f"{y}-{m:02d}"
                 rows.append({
@@ -361,7 +373,7 @@ def main():
                     "month": m,
                     "month_label": ml,
                     "transaction_id": txn_id,
-                    "fd_status": row["fd_status"],
+                    "fd_status": status,
                     "amount": amount,
                     "billing_rate": rate,
                     "active_days": days,
@@ -485,10 +497,7 @@ def main():
                 "Billing_Diff": diff,
                 "Billing_Diff_Pct": diff_pct,
                 "FD_Count_Diff": our_fds - ptr_fds,
-                "Note": (
-                    "Our calc includes WITHDRAW FDs through maturity; "
-                    "partner excludes them"
-                ),
+                "Note": "",
             })
     bank_comp = pd.DataFrame(bank_comp_rows)
 
